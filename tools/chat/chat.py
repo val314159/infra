@@ -28,7 +28,7 @@ Description:
 
 __version__ = '0.1.0'
 
-HELP_MESSAGE = '''~/lab Chat CLI Commands
+HELP_MESSAGE = '''Lab Infra Chat CLI Commands
 
 Conversation:
   /convo [name|uuid]       Change or list conversations
@@ -107,14 +107,50 @@ class ChatCLI:
         self.setup_completion()
     
     def load_config(self, config_path: str = None) -> Dict:
-        """Load configuration from YAML file."""
+        """Load configuration from YAML file with defaults."""
+        # Default configuration
+        default_config = {
+            'default_model': 'firmen102/qwen3.5-27b',
+            'default_endpoint': 'ollama',
+            'endpoints': {
+                'openai': {
+                    'url': 'https://api.openai.com/v1',
+                    'key_env': 'OPENAI_API_KEY'
+                },
+                'ollama': {
+                    'url': 'http://localhost:11434/v1',
+                    'key_env': None
+                },
+                'vllm': {
+                    'url': 'http://localhost:8000/v1',
+                    'key_env': None
+                }
+            },
+            'lab_root': os.getcwd(),
+            'conversation_store': 'infra/convos',
+            'prompt_library': 'infra/prompts',
+            'auto_inject_makefile': True,
+            'file_permissions': {
+                'immutable': 444,
+                'mutable': 644,
+                'directory': 755
+            }
+        }
+        
         if config_path is None:
+            # Look in infra/config/ first, then fallback to local config
             config_path = __file__ \
                 .replace('.py', '.yaml') \
                 .replace('/infra/tools/chat/', '/infra/config/')
         
-        with open(config_path, 'r') as f:
-            return pyyaml.safe_load(f)
+        # Load config file if it exists
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                loaded_config = pyyaml.safe_load(f)
+            # Merge with defaults (loaded config takes precedence)
+            default_config.update(loaded_config)
+        
+        return default_config
     
     def setup_openai(self):
         """Setup OpenAI client for current endpoint."""

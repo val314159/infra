@@ -338,8 +338,8 @@ endpoints:
     url: http://localhost:8000/v1
     key_env: null
 lab_root: /home/val/lab
-conversation_store: /home/val/lab/infra/convos
-prompt_library: /home/val/lab/infra/prompts
+conversation_store: infra/convos
+prompt_library: infra/prompts
 auto_inject_makefile: true
 file_permissions:
   immutable: 444
