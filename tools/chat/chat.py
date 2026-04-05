@@ -14,7 +14,7 @@ Options:
   --version          Show version
 
 Description:
-  The ~/lab Chat CLI provides an interactive interface for AI conversations
+  The Lab Infra Chat CLI provides an interactive interface for AI conversations
   with persistent storage, composable prompts, and filesystem navigation.
   
   Features:
@@ -84,6 +84,7 @@ from docopt import docopt
 class ChatCLI:
     def __init__(self, config_path: str = None):
         self.config = self.load_config(config_path)
+        print("C", self.config)
         self.lab_root = Path(self.config['lab_root'])
         self.convos_dir = Path(self.config['conversation_store'])
         self.prompts_dir = Path(self.config['prompt_library'])
@@ -741,7 +742,7 @@ class ChatCLI:
     
     def run(self):
         """Main chat loop."""
-        print("Welcome to ~/lab Chat CLI")
+        print("Welcome to Lab Infra Chat CLI")
         print("Type /help for commands, /quit to exit")
         print()
         

@@ -1,6 +1,6 @@
 
-cli::	
-	@make -C infra $@
+infra::	
+	uv run --env-file $@/.env --project $@ $@
 
 clean::
 	find . -name \*~ -o -name .\*~ | xargs rm -fr
