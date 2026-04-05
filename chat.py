@@ -1,7 +1,7 @@
 try:
-    from  tools.chat import chat
-except:
-    from .tools.chat import chat
+    from tools.chat.chat import main
+except ImportError:
+    from .tools.chat.chat import main
 
 if __name__ == "__main__":
-    chat.main()
+    main()

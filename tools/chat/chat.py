@@ -1,10 +1,71 @@
 #!/usr/bin/env python3
 """
-~/lab Chat CLI
+Lab Infra Chat CLI
 
 A readline-based chat interface for AI conversations with persistent storage,
 prompt composition, and filesystem navigation.
+
+Usage:
+  chat.py [--config=<path>] [--help] [--version]
+
+Options:
+  --config=<path>    Path to configuration file [default: infra/config/chat.yaml]
+  --help             Show this help message
+  --version          Show version
+
+Description:
+  The ~/lab Chat CLI provides an interactive interface for AI conversations
+  with persistent storage, composable prompts, and filesystem navigation.
+  
+  Features:
+  - OpenAI-compatible HTTP (works with OpenAI, Ollama, and vllm)
+  - Composable prompt system with snapshots
+  - Persistent conversations as immutable numbered files
+  - Slash commands for navigation and control
+  - Tab completion for commands and filenames
+  - Status line showing current state
 """
+
+__version__ = '0.1.0'
+
+HELP_MESSAGE = '''~/lab Chat CLI Commands
+
+Conversation:
+  /convo [name|uuid]       Change or list conversations
+  /convo new [name]        Start new conversation
+  /convo list              List conversations in current context
+
+Navigation:
+  /switch [path]           Change context directory
+  /switch list             List available contexts
+
+Prompts:
+  /prompts                 List available prompts
+  /prompt add [name]       Add prompt to current conversation
+  /prompt drop [name]      Remove prompt from current conversation
+
+Injection:
+  /inject [file]           Inject file into context
+  /inject list             Show currently injected files
+  /inject drop [file]      Remove injected file
+  /inject clear            Remove all injected files
+
+Model:
+  /model [name]            Switch model (optionally with endpoint)
+  /model list              List available endpoints
+
+Info:
+  /status                  Show current status
+  /history                 Show conversation history
+  /help                    Show this help
+  /quit                    Exit the chat
+
+Examples:
+  /switch research/docker
+  /prompt add researcher
+  /inject README.md
+  /model gpt-4o:local
+'''
 
 import os
 import sys
@@ -18,7 +79,7 @@ import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import openai
-import argparse
+from docopt import docopt
 
 class ChatCLI:
     def __init__(self, config_path: str = None):
@@ -41,7 +102,8 @@ class ChatCLI:
         # Ensure directories exist
         self.convos_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup readline completion
+        # Setup history and readline
+        self.setup_history()
         self.setup_completion()
     
     def load_config(self, config_path: str = None) -> Dict:
@@ -66,6 +128,34 @@ class ChatCLI:
         else:
             # Local endpoint (Ollama)
             self.client = openai.OpenAI(base_url=endpoint_config['url'], api_key='not-needed')
+    
+    def setup_history(self):
+        """Setup command line history persistence."""
+        # Create ~/.lab directory if it doesn't exist
+        lab_home = Path.home() / '.lab'
+        lab_home.mkdir(exist_ok=True)
+        
+        # History file path
+        self.history_file = lab_home / '.cli-history'
+        
+        # Load existing history
+        if self.history_file.exists():
+            readline.read_history_file(str(self.history_file))
+        
+        # Set history length
+        readline.set_history_length(1000)
+        
+        # Save history on exit
+        import atexit
+        atexit.register(self.save_history)
+    
+    def save_history(self):
+        """Save command line history to file."""
+        try:
+            readline.write_history_file(str(self.history_file))
+        except Exception as e:
+            # Don't crash on history save errors
+            pass
     
     def setup_completion(self):
         """Setup readline tab completion."""
@@ -101,7 +191,23 @@ class ChatCLI:
         if not existing:
             return '0001'
         
-        max_num = max(int(f.stem) for f in existing)
+        # Extract numeric part from filenames like "0001-meta.yaml"
+        numbers = []
+        for f in existing:
+            stem = f.stem
+            if '-' in stem:
+                num_part = stem.split('-')[0]
+            else:
+                num_part = stem
+            try:
+                numbers.append(int(num_part))
+            except ValueError:
+                continue
+        
+        if not numbers:
+            return '0001'
+        
+        max_num = max(numbers)
         return f"{max_num + 1:04d}"
     
     def write_convo_file(self, convo_dir: Path, content: Any, file_type: str):
@@ -569,44 +675,7 @@ class ChatCLI:
     
     def show_help(self):
         """Show help information."""
-        print("""~/lab Chat CLI Commands
-
-Conversation:
-  /convo [name|uuid]       Change or list conversations
-  /convo new [name]        Start new conversation
-  /convo list              List conversations in current context
-
-Navigation:
-  /switch [path]           Change context directory
-  /switch list             List available contexts
-
-Prompts:
-  /prompts                 List available prompts
-  /prompt add [name]       Add prompt to current conversation
-  /prompt drop [name]      Remove prompt from current conversation
-
-Injection:
-  /inject [file]           Inject file into context
-  /inject list             Show currently injected files
-  /inject drop [file]      Remove injected file
-  /inject clear            Remove all injected files
-
-Model:
-  /model [name]            Switch model (optionally with endpoint)
-  /model list              List available endpoints
-
-Info:
-  /status                  Show current status
-  /history                 Show conversation history
-  /help                    Show this help
-  /quit                    Exit the chat
-
-Examples:
-  /switch research/docker
-  /prompt add researcher
-  /inject README.md
-  /model gpt-4o:local
-""")
+        print(HELP_MESSAGE)
     
     def get_status_line(self) -> str:
         """Generate status line for display."""
@@ -672,11 +741,15 @@ Examples:
                 print(f"Error: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description='~/lab Chat CLI')
-    parser.add_argument('--config', help='Path to config file')
-    args = parser.parse_args()
+    """Main entry point for the CLI."""
+    args = docopt(__doc__, version=f'Lab Infra Chat CLI {__version__}')
     
-    cli = ChatCLI(args.config)
+    config_path = args.get('--config')
+    if config_path == 'infra/config/chat.yaml':
+        # Default path - let the CLI figure out the full path
+        config_path = None
+    
+    cli = ChatCLI(config_path)
     cli.run()
 
 if __name__ == '__main__':

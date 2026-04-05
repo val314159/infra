@@ -312,27 +312,39 @@ If a `Makefile` exists in the current context directory, it is auto-injected on 
 
 ### Features
 
-- OpenAI-compatible HTTP (works with OpenAI and Ollama)
+- OpenAI-compatible HTTP (works with OpenAI, Ollama, and vllm)
 - Composable prompt system with snapshots
 - Persistent conversations as immutable numbered files
 - `/commands` for navigation and control
 - Tab completion for commands and filenames
 - Status line showing current state
+- Persistent command line history in `~/.lab/.cli-history`
+- docopt-ng command line parsing using module `__doc__`
 
 ### Configuration
 
 ```yaml
-# infra/tools/chat/config.yaml
-default_model: gpt-4o
-default_endpoint: openai
+# infra/config/chat.yaml
+default_model: firmen102/qwen3.5-27b
+default_endpoint: ollama
 endpoints:
   openai:
     url: https://api.openai.com/v1
     key_env: OPENAI_API_KEY
-  local:
+  ollama:
     url: http://localhost:11434/v1
     key_env: null
-lab_root: ~/lab
+  vllm:
+    url: http://localhost:8000/v1
+    key_env: null
+lab_root: /home/val/lab
+conversation_store: /home/val/lab/infra/convos
+prompt_library: /home/val/lab/infra/prompts
+auto_inject_makefile: true
+file_permissions:
+  immutable: 444
+  mutable: 644
+  directory: 755
 ```
 
 ### Commands
@@ -398,9 +410,47 @@ messages: 14
 ### Model Backend
 
 - **Ollama** for local models — pull and run, automatic memory management, model switching without restart, OpenAI-compatible endpoint at `localhost:11434`
+- **VLLM** for high-performance local inference — OpenAI-compatible endpoint at `localhost:8000`
 - **OpenAI** for cloud models — same HTTP interface, different endpoint and key
 
-Ollama is preferred for multi-model experimentation. vLLM is not used — it requires a server restart to swap models.
+Ollama is preferred for multi-model experimentation. VLLM provides high-performance local inference. vLLM is not used — it requires a server restart to swap models.
+
+## Implementation Details
+
+### CLI Architecture
+
+The CLI is implemented as a single Python file at `infra/tools/chat/chat.py` with:
+
+- **docopt-ng** for command line parsing using the module's `__doc__` string
+- **readline** for interactive input with tab completion and history
+- **Persistent history** saved to `~/.lab/.cli-history`
+- **OpenAI Python package** for API communication
+- **PyYAML** for configuration and conversation file handling
+
+### Dependencies
+
+```toml
+[project]
+dependencies = [
+    "docopt-ng>=0.7.2",
+    "openai>=2.30.0",
+    "pyaml>=26.2.1",
+]
+```
+
+### Entry Point
+
+The CLI is invoked via the Makefile:
+```makefile
+cli:
+	PYTHONPATH=infra python3 -c "from infra.tools.chat.chat import main; main()"
+```
+
+Or directly with docopt-ng options:
+```bash
+python3 -c "from infra.tools.chat.chat import main; main()" --help
+python3 -c "from infra.tools.chat.chat import main; main()" --version
+```
 
 -----
 
