@@ -109,6 +109,7 @@ class ChatCLI:
         self.convos_dir = Path(self.config['conversation_store'])
         self.prompts_dir = Path(self.config['prompt_library'])
         self.state_file = self.lab_home / 'chat_state.json'
+        self.first_convo: Optional[str] = None
         
         # Current state
         self.current_context = self.lab_root
@@ -119,11 +120,13 @@ class ChatCLI:
         self.injected_files = []
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
+        self.last_injected_set: Optional[set] = None
 
         self.load_state()
         self.load_context_state()
         self.inject_files()
         self.apply_manual_injections_from_context_state()
+        self.last_injected_set = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
         
         # Setup OpenAI client
         self.setup_openai()
@@ -158,8 +161,6 @@ class ChatCLI:
             return
 
         ctx = state.get('last_context')
-        if not isinstance(ctx, str):
-            ctx = state.get('context')
 
         if isinstance(ctx, str):
             candidate = Path(ctx)
@@ -169,12 +170,17 @@ class ChatCLI:
             if candidate.exists() and candidate.is_dir() and self.is_valid_context(candidate):
                 self.current_context = candidate
 
+        fc = state.get('first_convo')
+        if isinstance(fc, str) and fc:
+            self.first_convo = fc
+
     def save_state(self):
         try:
             self.lab_home.mkdir(parents=True, exist_ok=True)
             state = {
                 'lab_root': str(self.lab_root.resolve()),
                 'last_context': str(self.current_context.resolve()),
+                'first_convo': self.first_convo,
                 'saved_at': datetime.datetime.now().isoformat() + 'Z',
             }
             with open(self.state_file, 'w') as f:
@@ -208,7 +214,6 @@ class ChatCLI:
 
         candidates = [
             state.get('last_convo'),
-            state.get('latest_convo'),
         ]
         selected = None
         for candidate in candidates:
@@ -230,15 +235,13 @@ class ChatCLI:
         except Exception:
             return
 
-    def set_context_convo(self, convo_id: Optional[str], *, mark_latest: bool = False):
+    def set_context_convo(self, convo_id: Optional[str]):
         self.current_convo = convo_id
 
         if not isinstance(getattr(self, 'current_context_state', None), dict):
             self.current_context_state = {}
 
         self.current_context_state['last_convo'] = convo_id
-        if mark_latest:
-            self.current_context_state['latest_convo'] = convo_id
 
         self.save_context_state()
 
@@ -415,11 +418,20 @@ class ChatCLI:
         except Exception:
             pass
 
+        injected_yaml_mtime = None
+        try:
+            injected_yaml_path = self.current_context / 'injected.yaml'
+            if injected_yaml_path.exists():
+                injected_yaml_mtime = injected_yaml_path.stat().st_mtime
+        except Exception:
+            injected_yaml_mtime = None
+
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
             'context': context_rel,
             'model': self.current_model,
             'endpoint': self.current_endpoint,
+            'injected_yaml_mtime': injected_yaml_mtime,
             'prompts': [
                 {
                     'prompt': prompt['name'],
@@ -443,6 +455,105 @@ class ChatCLI:
                 payload['title'] = title
 
         return payload
+
+    def compute_auto_injected_files(self) -> List[Dict[str, Any]]:
+        injected_files: List[Dict[str, Any]] = []
+
+        if self.config.get('auto_inject_makefile', True):
+            makefile_path = self.current_context / 'Makefile'
+            if makefile_path.exists():
+                injected_files.append({
+                    'file': str(makefile_path.relative_to(self.lab_root)),
+                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                })
+
+        injected_yaml_path = self.current_context / 'injected.yaml'
+        if injected_yaml_path.exists():
+            try:
+                with open(injected_yaml_path, 'r') as f:
+                    injected_config = pyyaml.safe_load(f)
+            except Exception:
+                injected_config = None
+
+            if isinstance(injected_config, list):
+                for item in injected_config:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('auto', True):
+                        file_str = item.get('file')
+                        if not isinstance(file_str, str):
+                            continue
+                        file_path = self.lab_root / file_str
+                        if file_path.exists():
+                            injected_files.append({
+                                'file': file_str,
+                                'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                            })
+
+        return injected_files
+
+    def refresh_injected_files(self, *, notify: bool, record_meta: bool):
+        prev_set = self.last_injected_set or {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
+
+        injected_files = self.compute_auto_injected_files()
+
+        manual = None
+        if isinstance(getattr(self, 'current_context_state', None), dict):
+            manual = self.current_context_state.get('manual_inject')
+
+        if isinstance(manual, list):
+            seen = {inj.get('file') for inj in injected_files if isinstance(inj, dict)}
+            for file_path in manual:
+                if not isinstance(file_path, str):
+                    continue
+                if file_path in seen:
+                    continue
+                injected_files.append({
+                    'file': file_path,
+                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                })
+                seen.add(file_path)
+
+        new_set = {inj.get('file') for inj in injected_files if isinstance(inj, dict)}
+        added = sorted([p for p in (new_set - prev_set) if isinstance(p, str)])
+        removed = sorted([p for p in (prev_set - new_set) if isinstance(p, str)])
+
+        self.injected_files = injected_files
+        self.last_injected_set = new_set
+
+        if not added and not removed:
+            return
+
+        if notify:
+            msg_parts = []
+            if added:
+                msg_parts.append(f"+{len(added)}")
+            if removed:
+                msg_parts.append(f"-{len(removed)}")
+            summary = ' '.join(msg_parts) if msg_parts else '0'
+            detail = []
+            if added:
+                detail.append('+' + ', +'.join(added))
+            if removed:
+                detail.append('-' + ', -'.join(removed))
+            detail_str = (' ' + ' '.join(detail)) if detail else ''
+            print(f"Injected set changed ({summary}){detail_str}")
+
+        if record_meta and self.current_convo:
+            event_meta: Dict[str, Any] = {
+                'timestamp': datetime.datetime.now().isoformat() + 'Z',
+                'event': 'injected_set_changed',
+                'context': str(self.current_context.relative_to(self.lab_root)),
+                'added': added,
+                'removed': removed,
+            }
+            try:
+                injected_yaml_path = self.current_context / 'injected.yaml'
+                if injected_yaml_path.exists():
+                    event_meta['injected_yaml_mtime'] = injected_yaml_path.stat().st_mtime
+            except Exception:
+                pass
+            self.write_convo_meta(self.current_convo, event_meta)
 
     def write_convo_meta(self, convo_id: str, meta: Dict[str, Any]):
         convo_dir = self.get_convo_path(convo_id)
@@ -476,7 +587,9 @@ class ChatCLI:
         # Create symlink in current context
         self.create_convo_symlink(convo_id, name)
         
-        self.set_context_convo(convo_id, mark_latest=True)
+        self.set_context_convo(convo_id)
+        if not self.first_convo:
+            self.first_convo = convo_id
         self.save_state()
         return convo_id
     
@@ -532,30 +645,7 @@ class ChatCLI:
     
     def inject_files(self):
         """Inject configured files into context."""
-        injected_yaml_path = self.current_context / 'injected.yaml'
-        
-        # Auto-inject Makefile if it exists
-        if self.config.get('auto_inject_makefile', True):
-            makefile_path = self.current_context / 'Makefile'
-            if makefile_path.exists():
-                self.injected_files.append({
-                    'file': str(makefile_path.relative_to(self.lab_root)),
-                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
-                })
-        
-        # Load injected.yaml if it exists
-        if injected_yaml_path.exists():
-            with open(injected_yaml_path, 'r') as f:
-                injected_config = pyyaml.safe_load(f)
-            
-            for item in injected_config:
-                if item.get('auto', True):
-                    file_path = self.lab_root / item['file']
-                    if file_path.exists():
-                        self.injected_files.append({
-                            'file': item['file'],
-                            'injected_at': datetime.datetime.now().isoformat() + 'Z'
-                        })
+        self.injected_files.extend(self.compute_auto_injected_files())
     
     def build_context(self) -> str:
         """Build the full context for the AI."""
@@ -592,6 +682,8 @@ class ChatCLI:
         """Send a message to the AI and get response."""
         if not self.current_convo:
             self.create_convo()
+
+        self.refresh_injected_files(notify=True, record_meta=True)
         
         convo_dir = self.get_convo_path(self.current_convo)
         
@@ -824,6 +916,7 @@ class ChatCLI:
             self.load_context_state()
             self.inject_files()
             self.apply_manual_injections_from_context_state()
+            self.last_injected_set = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
             self.save_state()
 
             new_convo = self.current_convo

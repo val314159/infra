@@ -165,7 +165,9 @@ Context-related files live inside the context directory:
 
 - `injected.yaml` — declarative per-topic injection configuration
 - `convos/` — local symlinks to conversations in the canonical store
-- `convos/context_state.json` — per-context persistence (last convo + manual injections)
+- `<context>/convos/context_state.json`
+  - **Scope**: per-context
+  - **Contains**: `last_convo`, `manual_inject`
 
 ### Why
 
@@ -181,7 +183,7 @@ On `/switch <path>`, the CLI:
 
 - Loads per-context state from `<context>/convos/context_state.json`.
 - Selects the active conversation using priority:
-  - `last_convo`, then `latest_convo`, else `None`.
+  - `last_convo`, else `None`.
 - Loads auto injections (`injected.yaml` and optional Makefile).
 - Applies persisted manual injections (`manual_inject`).
 
@@ -335,6 +337,10 @@ Each topic directory owns an `injected.yaml` that defines what files get loaded 
 
 The chat CLI keeps an in-memory list of injected **file references**, and reads the current contents from disk whenever it builds the system prompt. This means injected content always reflects the latest state of the working tree.
 
+The injection **selection** is refreshed on every conversation turn: before sending a message, the CLI rebuilds the injected file reference set from the current context's `injected.yaml` (and optional `Makefile`) plus `manual_inject` from `convos/context_state.json`.
+
+If the effective injected set changes between turns, the CLI prints a brief notice and records an `injected_set_changed` event in the convo's `*-meta.yaml` stream with `added`, `removed`, and `injected_yaml_mtime`.
+
 Manual injections made via `/inject <file>` persist per context in `<context>/convos/context_state.json` under the `manual_inject` list.
 
 ### Format in Prompt
@@ -367,6 +373,8 @@ If a `Makefile` exists in the current context directory, it is auto-injected on 
 - Status line showing current state
 - Persistent command line history in `~/.lab/.cli-history`
 - Persistent last-used context in `~/.lab/chat_state.json`
+  - **Scope**: global (across all contexts)
+  - **Contains**: `last_context`, `first_convo`
 - docopt-ng command line parsing using module `__doc__`
 
 ### Configuration
@@ -403,7 +411,6 @@ Per-context state lives in `<context>/convos/context_state.json`:
 ```json
 {
   "last_convo": "<uuid>",
-  "latest_convo": "<uuid>",
   "manual_inject": ["path/to/file", "path/to/other"]
 }
 ```
