@@ -1,0 +1,13 @@
+[project]
+name = "infra"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bottle>=0.13.4",
+    "gevent-websocket>=0.10.1",
+    "openai>=2.30.0",
+    "pyaml>=26.2.1",
+    "websocket-client>=1.9.0",
+]
