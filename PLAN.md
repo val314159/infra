@@ -81,7 +81,7 @@ title: Infrastructure Engineer
 type: system              # system | template | workflow
 model: claude-sonnet-4    # model this was tuned for
 version: 1.2
-date: 2026-04-01
+timestamp: 2026-04-01T00:00:00Z
 tags: [infra, ops]
 status: active            # active | draft | archived
 supersedes: null          # filename of previous version if applicable
@@ -146,6 +146,47 @@ infra/prompts/workflows/
 
 ## Conversation System
 
+-----
+
+## Context
+
+### What
+
+A **context** is the current working directory the chat CLI is operating within (a directory under `lab_root`). Context is a first-class concept: it determines what gets auto-injected, which human-readable convo symlinks are available, and which conversation the CLI resumes by default.
+
+### When
+
+- A context is selected at startup by restoring the last context from `~/.lab/chat_state.json` (if valid), otherwise it defaults to `lab_root`.
+- A context changes when you run `/switch <path>`.
+
+### Where
+
+Context-related files live inside the context directory:
+
+- `injected.yaml` — declarative per-topic injection configuration
+- `convos/` — local symlinks to conversations in the canonical store
+- `convos/context_state.json` — per-context persistence (last convo + manual injections)
+
+### Why
+
+Contexts keep AI work compartmentalized:
+
+- A topic directory owns its own injection config (`injected.yaml`) and local convo symlinks.
+- Switching context changes what the model sees (injections + “current context” metadata).
+- Context-local state allows “resume where I left off” per topic without a large global registry.
+
+### How
+
+On `/switch <path>`, the CLI:
+
+- Loads per-context state from `<context>/convos/context_state.json`.
+- Selects the active conversation using priority:
+  - `last_convo`, then `latest_convo`, else `None`.
+- Loads auto injections (`injected.yaml` and optional Makefile).
+- Applies persisted manual injections (`manual_inject`).
+
+If a conversation was active before the switch, the CLI appends a `*-meta.yaml` event into the conversation being left to record the jump (timestamp + destination context + destination convo). The destination conversation is not modified just because you navigated into it.
+
 ### Canonical Store
 
 All conversations are stored in `infra/convos/` with UUID filenames:
@@ -181,12 +222,14 @@ A single conversation can be symlinked into multiple topic directories if it spa
 
 Each file in a convo directory is written once, immediately `chmod 444`, and never modified.
 
+In addition to the initial `0001-meta.yaml`, the chat CLI appends additional numbered `*-meta.yaml` files whenever conversation-relevant state changes (context switch, model/endpoint, prompt set, injected file set). These meta snapshots make it possible to reconstruct “what the model saw” over time from the convo directory alone.
+
 **Meta file** (`0001-meta.yaml`) — dict, always the first file:
 
 ```yaml
 title: Docker Networking Deep Dive
 uuid: 550e8400-e29b-41d4-a716-446655440000
-date: 2026-04-02T09:00:00Z
+timestamp: 2026-04-02T09:00:00Z
 model: gpt-4o
 endpoint: openai          # openai | local (ollama)
 fork_of: null             # UUID of parent convo if forked
@@ -290,6 +333,10 @@ Each topic directory owns an `injected.yaml` that defines what files get loaded 
 
 `auto: true` files are silently loaded. `auto: false` files prompt for confirmation.
 
+The chat CLI keeps an in-memory list of injected **file references**, and reads the current contents from disk whenever it builds the system prompt. This means injected content always reflects the latest state of the working tree.
+
+Manual injections made via `/inject <file>` persist per context in `<context>/convos/context_state.json` under the `manual_inject` list.
+
 ### Format in Prompt
 
 Injected files are wrapped in XML tags:
@@ -319,6 +366,7 @@ If a `Makefile` exists in the current context directory, it is auto-injected on 
 - Tab completion for commands and filenames
 - Status line showing current state
 - Persistent command line history in `~/.lab/.cli-history`
+- Persistent last-used context in `~/.lab/chat_state.json`
 - docopt-ng command line parsing using module `__doc__`
 
 ### Configuration
@@ -341,10 +389,23 @@ lab_root: /home/val/lab
 conversation_store: infra/convos
 prompt_library: infra/prompts
 auto_inject_makefile: true
+restore_last_convo: true
 file_permissions:
   immutable: 444
   mutable: 644
   directory: 755
+```
+
+`lab_root` is authoritative from config. Global state in `~/.lab/chat_state.json` records the last `context`, but the CLI only restores a saved `context` if it still exists on disk and is inside the configured `lab_root`.
+
+Per-context state lives in `<context>/convos/context_state.json`:
+
+```json
+{
+  "last_convo": "<uuid>",
+  "latest_convo": "<uuid>",
+  "manual_inject": ["path/to/file", "path/to/other"]
+}
 ```
 
 ### Commands
@@ -387,14 +448,18 @@ file_permissions:
 ```
 /model [name]            switch model for current convo
 /model list              list available models (local: ollama, remote: openai)
-/model pull [name]       pull a new model via ollama
 ```
 
 **Info:**
 
 ```
-/status                  show current convo, prompts, model, message count
-/history                 show current convo messages
+/show config             show current configuration
+/show status             show current status
+/show history            show conversation history
+/status                  alias for /show status
+/history                 alias for /show history
+/help                    show command help
+/quit                    exit the chat
 ```
 
 ### Status Display
