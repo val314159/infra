@@ -55,10 +55,11 @@ Model:
   /model list              List available endpoints
 
 Info:
-  /status                  Show current status
-  /history                 Show conversation history
-  /help                    Show this help
-  /quit                    Exit the chat
+  /show config            Show current configuration
+  /show status            Show current status
+  /show history           Show conversation history
+  /help                   Show this help
+  /quit                   Exit the chat
 
 Examples:
   /switch research/docker
@@ -82,9 +83,14 @@ import openai
 from docopt import docopt
 
 class ChatCLI:
+    # Unix permission constants (core architectural choices)
+    PERM_IMMUTABLE = 0o444  # read-only for all
+    PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
+    PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
+
     def __init__(self, config_path: str = None):
         self.config = self.load_config(config_path)
-        print("C", self.config)
+
         self.lab_root = Path(self.config['lab_root'])
         self.convos_dir = Path(self.config['conversation_store'])
         self.prompts_dir = Path(self.config['prompt_library'])
@@ -109,6 +115,9 @@ class ChatCLI:
     
     def load_config(self, config_path: str = None) -> Dict:
         """Load configuration from YAML file with defaults."""
+
+        cur_dir = os.getcwd()
+
         # Default configuration
         default_config = {
             'default_model': 'firmen102/qwen3.5-27b',
@@ -127,22 +136,15 @@ class ChatCLI:
                     'key_env': None
                 }
             },
-            'lab_root': os.getcwd(),
+            'lab_root': cur_dir,
             'conversation_store': 'infra/convos',
             'prompt_library': 'infra/prompts',
-            'auto_inject_makefile': True,
-            'file_permissions': {
-                'immutable': 444,
-                'mutable': 644,
-                'directory': 755
-            }
+            'auto_inject_makefile': True
         }
         
         if config_path is None:
-            # Look in infra/config/ first, then fallback to local config
-            config_path = __file__ \
-                .replace('.py', '.yaml') \
-                .replace('/infra/tools/chat/', '/infra/config/')
+            # reasonable default
+            config_path = Path(cur_dir) / 'infra' / 'config' / 'chat.yaml'
         
         # Load config file if it exists
         if os.path.exists(config_path):
@@ -196,7 +198,7 @@ class ChatCLI:
     
     def setup_completion(self):
         """Setup readline tab completion."""
-        commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/status', '/history', '/help', '/quit']
+        commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/show', '/help', '/quit']
         
         def completer(text, state):
             options = []
@@ -254,9 +256,9 @@ class ChatCLI:
         
         with open(filepath, 'w') as f:
             pyyaml.dump(content, f, default_flow_style=False)
-        
+
         # Make immutable
-        os.chmod(filepath, int(self.config['file_permissions']['immutable'], 8))
+        os.chmod(filepath, self.PERM_IMMUTABLE)
     
     def create_convo(self, name: str = None) -> str:
         """Create a new conversation."""
@@ -489,6 +491,8 @@ class ChatCLI:
         
         if command == '/help':
             self.show_help()
+        elif command == '/show':
+            self.handle_show(args)
         elif command == '/quit' or command == '/exit':
             print("Goodbye!")
             sys.exit(0)
@@ -554,6 +558,57 @@ class ChatCLI:
                 print(f"Switched to conversation: {convo_name}")
             else:
                 print(f"Conversation '{convo_name}' not found")
+    
+    def handle_show(self, args: List[str]):
+        """Handle show commands."""
+        if not args:
+            print("Usage: /show <subcommand>")
+            print("  config   - Show current configuration")
+            print("  status   - Show current status")
+            print("  history  - Show conversation history")
+            return
+        
+        subcommand = args[0]
+        
+        if subcommand == 'config':
+            self.show_config()
+        elif subcommand == 'status':
+            self.show_status()
+        elif subcommand == 'history':
+            self.show_history()
+        else:
+            print(f"Unknown show subcommand: {subcommand}")
+            print("Available: config, status, history")
+    
+    def show_config(self):
+        """Show current configuration."""
+        print("Current Configuration:")
+        print(f"  Model: {self.current_model} ({self.current_endpoint})")
+        print(f"  Lab Root: {self.lab_root}")
+        print(f"  Context: {self.current_context.relative_to(self.lab_root)}")
+        print(f"  Conversation Store: {self.convos_dir}")
+        print(f"  Prompt Library: {self.prompts_dir}")
+        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
+        print(f"  History File: {self.history_file}")
+        
+        if self.current_convo:
+            print(f"  Current Conversation: {self.current_convo}")
+        else:
+            print("  Current Conversation: None")
+        
+        if self.current_prompts:
+            print(f"  Active Prompts: {len(self.current_prompts)}")
+            for prompt in self.current_prompts:
+                print(f"    - {prompt['name']} v{prompt['version']}")
+        else:
+            print("  Active Prompts: None")
+        
+        if self.injected_files:
+            print(f"  Injected Files: {len(self.injected_files)}")
+            for injected in self.injected_files:
+                print(f"    - {injected['file']}")
+        else:
+            print("  Injected Files: None")
     
     def handle_switch(self, args: List[str]):
         """Handle context switching."""
