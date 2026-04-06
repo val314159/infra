@@ -1,5 +1,4 @@
 import os
-#import sys
 import uuid
 import yaml as pyyaml
 import json
@@ -9,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import openai
 
-class Chat:
+class Files:
     # Unix permission constants (core architectural choices)
     PERM_IMMUTABLE = 0o444  # read-only for all
     PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
@@ -26,39 +25,7 @@ class Chat:
     def get_context_state_file(self, context: Optional[Path] = None) -> Path:
         return self.get_context_convos_dir(context) / 'context_state.json'
 
-    def __init__(self, config_path: str = None):
-
-        self.config = self.load_config(config_path)
-
-        self.lab_root = Path(self.config['lab_root'])
-        self.convos_dir = Path(self.config['conversation_store'])
-        self.prompts_dir = Path(self.config['prompt_library'])
-        self.state_file = self.lab_home / 'chat_state.json'
-        self.first_convo: Optional[str] = None
-        
-        self.endpoints = self.config['endpoints']
-
-        # Current state
-        self.current_context = self.lab_root
-        self.current_convo = None
-        self.current_prompts = []
-        self.current_model = self.config['default_model']
-        self.current_endpoint = self.config['default_endpoint']
-        self.injected_files = []
-        self.auto_inject_makefile = self.config.get('auto_inject_makefile', True)
-
-        self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
-        self.last_injected_set: Optional[set] = None
-
-        self.load_state()
-        self.load_context_state()
-        self.inject_files()
-        self.apply_manual_injections_from_context_state()
-        self.last_injected_set = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-        
-        # Setup OpenAI client
-        self.setup_openai()
-        
+    def __init__(self):
         # Ensure directories exist
         self.convos_dir.mkdir(parents=True, exist_ok=True)
         
@@ -174,30 +141,8 @@ class Chat:
 
         self.save_context_state()
 
-    def apply_manual_injections_from_context_state(self):
-        if not isinstance(getattr(self, 'current_context_state', None), dict):
-            return
-
-        manual = self.current_context_state.get('manual_inject')
-        if not isinstance(manual, list):
-            return
-
-        seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-        for file_path in manual:
-            if not isinstance(file_path, str):
-                continue
-            if file_path in seen:
-                continue
-            self.injected_files.append({
-                'file': file_path,
-                'injected_at': datetime.datetime.now().isoformat() + 'Z'
-            })
-            seen.add(file_path)
-    
     def load_config(self, config_path: str = None) -> Dict:
         """Load configuration from YAML file with defaults."""
-
-        cur_dir = os.getcwd()
 
         # Default configuration
         default_config = {
@@ -217,16 +162,19 @@ class Chat:
                     'key_env': None
                 }
             },
-            'lab_root': cur_dir,
+            'lab_root': os.getcwd(),
+
             'conversation_store': 'infra/convos',
             'prompt_library': 'infra/prompts',
             'auto_inject_makefile': True
         }
         
+        lab_root = default_config['lab_root']
+
         if config_path is None:
             # reasonable default
-            config_path = Path(cur_dir) / 'infra' / 'config' / 'chat.yaml'
-        
+            config_path = Path(lab_root) / 'infra' / 'config' / 'chat.yaml'
+
         # Load config file if it exists
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
