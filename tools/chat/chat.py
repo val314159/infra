@@ -121,7 +121,6 @@ class ChatCLI:
         self.current_model = self.config['default_model']
         self.current_endpoint = self.config['default_endpoint']
         self.injected_files = []
-        self.retry_message: Optional[str] = ''
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
         self.last_injected_set: Optional[set] = None
@@ -335,9 +334,6 @@ class ChatCLI:
         self.history_file = self.lab_home / '.cli-history'
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         self.prompt_history = FileHistory(str(self.history_file))
-
-    def prompt_input(self, message: str = '', default: str = '') -> str:
-        return self.session.prompt(message, default=default)
 
     def append_history_line(self, line: str):
         if not line:
@@ -719,17 +715,12 @@ class ChatCLI:
         
         convo_dir = self.get_convo_path(self.current_convo)
 
-        pending_message = self.retry_message
-        retry_this_turn = bool(pending_message is not None and pending_message == message)
-        self.retry_message = ''
-        
-        if not retry_this_turn:
-            user_msg = [{
-                'role': 'user',
-                'content': message,
-                'timestamp': datetime.datetime.now().isoformat() + 'Z'
-            }]
-            self.write_convo_file(convo_dir, user_msg, 'user')
+        user_msg = [{
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z'
+        }]
+        self.write_convo_file(convo_dir, user_msg, 'user')
         
         # Build full context
         full_context = self.build_context()
@@ -747,8 +738,7 @@ class ChatCLI:
                 messages.append({'role': msg['role'], 'content': msg['content']})
         
         # Add current message
-        if not retry_this_turn:
-            messages.append({'role': 'user', 'content': message})
+        messages.append({'role': 'user', 'content': message})
         
         # Get AI response
         try:
@@ -1165,16 +1155,13 @@ class ChatCLI:
         print("Type /help for commands, /quit to exit")
         print()
         
+        if self.get_pending_user_message():
+            print("Error: incomplete user turn found in conversation history; fix the convo files and restart")
+            sys.exit(1)
+
         # Inject initial files
         self.inject_files()
 
-        pending_message = self.get_pending_user_message()
-        if pending_message is not None:
-            self.retry_message = pending_message
-            print("Pending user message detected; press Enter to retry or edit before sending")
-        else:
-            self.retry_message = ''
-        
         while True:
             try:
                 # Show status
@@ -1182,14 +1169,15 @@ class ChatCLI:
                 print(f"\n{status}")
                 
                 # Get input
-                line = self.prompt_input(">>> ", default=self.retry_message).strip()
+                line = self.session.prompt(">>> ")
+
+                self.append_history_line(line)
 
                 if not line:
                     continue
 
-                self.append_history_line(line)
 
-                if line.startswith('!'):
+                elif line.startswith('!'):
                     cmd = line[1:].strip()
                     if not cmd:
                         continue
@@ -1211,13 +1199,14 @@ class ChatCLI:
                     continue
                 
                 # Handle commands
-                if self.handle_command(line):
+                elif self.handle_command(line):
                     continue
                 
-                # Send message and show response
-                response = self.send_message(line)
-                print(f"\n{response}")
-                
+                else:
+                    # Send message and show response
+                    response = self.send_message(line)
+                    print(f"\n{response}")
+
             except KeyboardInterrupt:
                 print("\nUse /quit to exit")
             except EOFError:
