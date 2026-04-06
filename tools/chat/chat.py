@@ -56,10 +56,11 @@ Model:
 
 Info:
   /show config            Show current configuration
-  /show status            Show current status
+  /show status            Show current state
   /show history           Show conversation history
   /status                 Alias for /show status
   /history                Alias for /show history
+  !<cmd>                  Run a shell command in the current context
   /help                   Show this help
   /quit                   Exit the chat
   /exit                   Alias for /quit
@@ -143,6 +144,7 @@ class ChatCLI:
             context_resolved = context_path.resolve()
             lab_root_resolved = self.lab_root.resolve()
         except Exception:
+            print(f"Warning: Failed to resolve paths for context validation: {context_path}")
             return False
 
         if context_resolved == lab_root_resolved:
@@ -151,13 +153,14 @@ class ChatCLI:
         return lab_root_resolved in context_resolved.parents
 
     def load_state(self):
-        if not self.state_file.exists():
-            return
-
         try:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
+        except FileNotFoundError:
+            # do nothing
+            return
         except Exception:
+            print(f"Warning: Failed to load state file: {self.state_file}")
             return
 
         ctx = state.get('last_context')
@@ -186,19 +189,21 @@ class ChatCLI:
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2, sort_keys=True)
         except Exception:
+            print(f"Warning: Failed to save state file: {self.state_file}")
             return
 
     def load_context_state(self):
         context_state_file = self.get_context_state_file()
-        if not context_state_file.exists():
-            self.current_context_state = {}
-            self.current_convo = None
-            return
-
+        
         try:
             with open(context_state_file, 'r') as f:
                 state = json.load(f)
+        except FileNotFoundError:
+            self.current_context_state = {}
+            self.current_convo = None
+            return
         except Exception:
+            print(f"Warning: Failed to load context state file: {context_state_file}")
             self.current_context_state = {}
             self.current_convo = None
             return
@@ -233,6 +238,7 @@ class ChatCLI:
             with open(context_state_file, 'w') as f:
                 json.dump(self.current_context_state, f, indent=2, sort_keys=True)
         except Exception:
+            print(f"Warning: Failed to save context state file: {context_state_file}")
             return
 
     def set_context_convo(self, convo_id: Optional[str]):
@@ -322,9 +328,6 @@ class ChatCLI:
     
     def setup_history(self):
         """Setup command line history persistence."""
-        # Create ~/.lab directory if it doesn't exist
-        self.lab_home.mkdir(exist_ok=True)
-        
         # History file path
         self.history_file = self.lab_home / '.cli-history'
         
@@ -334,18 +337,31 @@ class ChatCLI:
         
         # Set history length
         readline.set_history_length(1000)
-        
-        # Save history on exit
-        import atexit
-        atexit.register(self.save_history)
-    
-    def save_history(self):
-        """Save command line history to file."""
+
+    def append_history_line(self, line: str):
+        if not line:
+            return
+
         try:
-            readline.write_history_file(str(self.history_file))
-        except Exception as e:
-            # Don't crash on history save errors
+            with open(self.history_file, 'a', encoding='utf-8') as f:
+                f.write(line.replace('\n', ' ') + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+                return
+        except FileNotFoundError:
+            try:
+                self.history_file.parent.mkdir(parents=True, exist_ok=True)
+                readline.write_history_file(str(self.history_file))
+            except Exception:
+                # pass thru
+                pass
+        except Exception:
+            # pass thru
             pass
+        
+        # error condition
+        print(f"Warning: Failed to write history file: {self.history_file}")
+        return
     
     def setup_completion(self):
         """Setup readline tab completion."""
@@ -361,7 +377,8 @@ class ChatCLI:
                     path = str(self.current_context)
                     files = glob.glob(os.path.join(path, text + '*'))
                     options = [os.path.basename(f) for f in files if os.path.isfile(f)]
-                except:
+                except Exception:
+                    print(f"Warning: Failed to list files in {path}")
                     pass
             
             if state < len(options):
@@ -392,6 +409,7 @@ class ChatCLI:
             try:
                 numbers.append(int(num_part))
             except ValueError:
+                print(f"Warning: Failed to parse number from {num_part}")
                 continue
         
         if not numbers:
@@ -412,11 +430,10 @@ class ChatCLI:
         os.chmod(filepath, self.PERM_IMMUTABLE)
 
     def build_meta_state(self, *, include_title: bool = False, title: Optional[str] = None, convo_id: Optional[str] = None) -> Dict[str, Any]:
-        context_rel = str(self.current_context.resolve())
         try:
             context_rel = str(self.current_context.relative_to(self.lab_root))
-        except Exception:
-            pass
+        except ValueError:
+            context_rel = str(self.current_context.resolve())
 
         injected_yaml_mtime = None
         try:
@@ -424,6 +441,7 @@ class ChatCLI:
             if injected_yaml_path.exists():
                 injected_yaml_mtime = injected_yaml_path.stat().st_mtime
         except Exception:
+            print(f"Warning: Failed to get mtime for {injected_yaml_path}")
             injected_yaml_mtime = None
 
         payload: Dict[str, Any] = {
@@ -473,6 +491,7 @@ class ChatCLI:
                 with open(injected_yaml_path, 'r') as f:
                     injected_config = pyyaml.safe_load(f)
             except Exception:
+                print(f"Warning: Failed to load injected.yaml from {injected_yaml_path}")
                 injected_config = None
 
             if isinstance(injected_config, list):
@@ -552,6 +571,7 @@ class ChatCLI:
                 if injected_yaml_path.exists():
                     event_meta['injected_yaml_mtime'] = injected_yaml_path.stat().st_mtime
             except Exception:
+                print(f"Warning: Failed to get mtime for {injected_yaml_path}")
                 pass
             self.write_convo_meta(self.current_convo, event_meta)
 
@@ -907,6 +927,7 @@ class ChatCLI:
         try:
             old_context_rel = str(self.current_context.relative_to(self.lab_root))
         except Exception:
+            print(f"Warning: Failed to get relative path for {self.current_context}")
             pass
 
         new_context = self.lab_root / args[0]
@@ -924,6 +945,7 @@ class ChatCLI:
             try:
                 new_context_rel = str(self.current_context.relative_to(self.lab_root))
             except Exception:
+                print(f"Warning: Failed to get relative path for {self.current_context}")
                 pass
 
             if old_convo:
@@ -1139,6 +1161,29 @@ class ChatCLI:
                 line = input(">>> ").strip()
                 
                 if not line:
+                    continue
+
+                self.append_history_line(line)
+
+                if line.startswith('!'):
+                    cmd = line[1:].strip()
+                    if not cmd:
+                        continue
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            shell=True,
+                            cwd=str(self.current_context),
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                        )
+                        if proc.stdout:
+                            print(proc.stdout.rstrip('\n'))
+                        if proc.returncode != 0:
+                            print(f"(exit {proc.returncode})")
+                    except Exception as e:
+                        print(f"Shell error: {e}")
                     continue
                 
                 # Handle commands

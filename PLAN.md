@@ -372,6 +372,7 @@ If a `Makefile` exists in the current context directory, it is auto-injected on 
 - Tab completion for commands and filenames
 - Status line showing current state
 - Persistent command line history in `~/.lab/.cli-history`
+  - Appended per command (durable write), not only on exit
 - Persistent last-used context in `~/.lab/chat_state.json`
   - **Scope**: global (across all contexts)
   - **Contains**: `last_context`, `first_convo`
@@ -468,6 +469,8 @@ Per-context state lives in `<context>/convos/context_state.json`:
 /help                    show command help
 /quit                    exit the chat
 ```
+
+You can also run shell commands by prefixing the line with `!`. This runs the command in the current context directory using a fresh shell process each time (not a TTY).
 
 ### Status Display
 
