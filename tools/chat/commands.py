@@ -1,12 +1,12 @@
-import os
 import sys
 import datetime
-from typing import Dict, List, Optional, Any
-
-from .help import HELP_MESSAGE
+from typing import Any
 
 class Commands:
     """Command mix-in"""
+
+    commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/show', '/help', '/quit']
+
     def handle_command(self, line: str) -> bool:
         """Handle slash commands. Returns True if command was handled."""
         if not line.startswith('/'):
@@ -19,7 +19,20 @@ class Commands:
         if command == '/help':
             self.show_help()
         elif command == '/show':
-            self.handle_show(args)
+            if not args:
+                print("Usage: /show <subcommand>")
+                print("  config   - Show current configuration")
+                print("  status   - Show current status")
+                print("  history  - Show conversation history")
+            elif args[0] == 'config':
+                self.show_config()
+            elif args[0] == 'status':
+                self.show_status()
+            elif args[0] == 'history':
+                self.show_history()
+            else:
+                print(f"Unknown show subcommand: {args[0]}")
+                print("Available: config, status, history")
         elif command == '/quit' or command == '/exit':
             print("Goodbye!")
             sys.exit(0)
@@ -82,61 +95,14 @@ class Commands:
                 target = symlink_path.readlink()
                 convo_id = target.name
                 self.set_context_convo(convo_id)
+                if not isinstance(getattr(self, 'current_context_state', None), dict):
+                    self.current_context_state = {}
+                self.current_context_state['last_convo_name'] = convo_name
+                self.save_context_state()
                 self.save_state()
                 print(f"Switched to conversation: {convo_name}")
             else:
                 print(f"Conversation '{convo_name}' not found")
-    
-    def handle_show(self, args: List[str]):
-        """Handle show commands."""
-        if not args:
-            print("Usage: /show <subcommand>")
-            print("  config   - Show current configuration")
-            print("  status   - Show current status")
-            print("  history  - Show conversation history")
-            return
-        
-        subcommand = args[0]
-        
-        if subcommand == 'config':
-            self.show_config()
-        elif subcommand == 'status':
-            self.show_status()
-        elif subcommand == 'history':
-            self.show_history()
-        else:
-            print(f"Unknown show subcommand: {subcommand}")
-            print("Available: config, status, history")
-    
-    def show_config(self):
-        """Show current configuration."""
-        print("Current Configuration:")
-        print(f"  Model: {self.current_model} ({self.current_endpoint})")
-        print(f"  Lab Root: {self.lab_root}")
-        print(f"  Context: {self.current_context.relative_to(self.lab_root)}")
-        print(f"  Conversation Store: {self.convos_dir}")
-        print(f"  Prompt Library: {self.prompts_dir}")
-        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
-        print(f"  History File: {self.history_file}")
-        
-        if self.current_convo:
-            print(f"  Current Conversation: {self.current_convo}")
-        else:
-            print("  Current Conversation: None")
-        
-        if self.current_prompts:
-            print(f"  Active Prompts: {len(self.current_prompts)}")
-            for prompt in self.current_prompts:
-                print(f"    - {prompt['name']} v{prompt['version']}")
-        else:
-            print("  Active Prompts: None")
-        
-        if self.injected_files:
-            print(f"  Injected Files: {len(self.injected_files)}")
-            for injected in self.injected_files:
-                print(f"    - {injected['file']}")
-        else:
-            print("  Injected Files: None")
     
     def handle_switch(self, args: List[str]):
         """Handle context switching."""
@@ -317,34 +283,3 @@ class Commands:
         self.write_meta_update()
         print(f"Switched to model: {model_name} ({self.current_endpoint})")
     
-    def show_status(self):
-        """Show current status."""
-        print(f"context: {self.current_context.relative_to(self.lab_root)}")
-        print(f"convo:   {self.current_convo or 'None'}")
-        if self.current_prompts:
-            prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.current_prompts])
-            print(f"prompts: {prompts_str}")
-        print(f"model:   {self.current_model} ({self.current_endpoint})")
-        
-        if self.current_convo:
-            history = self.load_convo_history()
-            message_count = len([msg for msg in history if msg['role'] in ['user', 'asst']])
-            print(f"messages: {message_count}")
-    
-    def show_history(self):
-        """Show conversation history."""
-        if not self.current_convo:
-            print("No active conversation")
-            return
-        
-        history = self.load_convo_history()
-        for msg in history:
-            if msg['role'] == 'user':
-                print(f"User: {msg['content']}")
-            elif msg['role'] == 'asst':
-                print(f"Assistant: {msg['content']}")
-            print()
-
-    def show_help(self):
-        """Show help information."""
-        print(HELP_MESSAGE)

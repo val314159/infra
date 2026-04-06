@@ -27,11 +27,8 @@ Description:
 """
 
 import os
-import sys
-import yaml as pyyaml
 import glob
 import subprocess
-from typing import Dict, List, Optional, Any
 
 from docopt import docopt
 from prompt_toolkit import PromptSession
@@ -43,6 +40,7 @@ from . import __version__
 from .chat import Chat
 from .files import Files
 from .commands import Commands
+from .help import HELP_MESSAGE
 
 class ChatCLI(Chat,Files,Commands):
 
@@ -60,27 +58,6 @@ class ChatCLI(Chat,Files,Commands):
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         self.prompt_history = FileHistory(str(self.history_file))
 
-    def get_pending_user_message(self) -> Optional[str]:
-        if not self.current_convo:
-            return None
-
-        history = self.load_convo_history()
-        if not history:
-            return None
-
-        last = history[-1]
-        if not isinstance(last, dict):
-            return None
-
-        if last.get('role') != 'user':
-            return None
-
-        content = last.get('content')
-        if not isinstance(content, str):
-            return None
-
-        return content
-    
     def append_history_line(self, line: str):
         if not line:
             return
@@ -96,13 +73,12 @@ class ChatCLI(Chat,Files,Commands):
     
     def setup_completion(self):
         """Setup prompt-toolkit tab completion."""
-        commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/show', '/help', '/quit']
 
         class ChatCompleter(Completer):
-            def get_completions(self, document, complete_event):
+            def get_completions(self, document, _complete_event):
                 text = document.text_before_cursor
                 if text.startswith('/'):
-                    for cmd in commands:
+                    for cmd in self.commands:
                         if cmd.startswith(text):
                             yield Completion(cmd, start_position=-len(text))
                     return
@@ -127,12 +103,13 @@ class ChatCLI(Chat,Files,Commands):
         parts.append(f"context: {self.current_context.relative_to(self.lab_root)}")
         
         if self.current_convo:
-            convo_dir = self.get_convo_path(self.current_convo)
-            meta_file = convo_dir / '0001-meta.yaml'
-            if meta_file.exists():
-                with open(meta_file, 'r') as f:
-                    meta = pyyaml.safe_load(f)
-                parts.append(f"convo: {meta['title']} ({self.current_convo[:8]})")
+            convo_name = None
+            if isinstance(getattr(self, 'current_context_state', None), dict):
+                convo_name = self.current_context_state.get('last_convo_name')
+            if isinstance(convo_name, str) and convo_name:
+                parts.append(f"convo: {convo_name}")
+            else:
+                parts.append(f"convo: {self.current_convo[:8]}")
         
         if self.current_prompts:
             prompts_str = ', '.join([f"{p['name']}" for p in self.current_prompts])
@@ -140,12 +117,64 @@ class ChatCLI(Chat,Files,Commands):
         
         parts.append(f"model: {self.current_model}")
         
-        if self.current_convo:
-            history = self.load_convo_history()
-            message_count = len([msg for msg in history if msg['role'] in ['user', 'asst']])
-            parts.append(f"messages: {message_count}")
-        
         return ' | '.join(parts)
+
+    def show_help(self):
+        """Show help information."""
+        print(HELP_MESSAGE)
+
+    def show_config(self):
+        """Show current configuration."""
+        print("Current Configuration:")
+        print(f"  Model: {self.current_model} ({self.current_endpoint})")
+        print(f"  Lab Root: {self.lab_root}")
+        print(f"  Context: {self.current_context.relative_to(self.lab_root)}")
+        print(f"  Conversation Store: {self.convos_dir}")
+        print(f"  Prompt Library: {self.prompts_dir}")
+        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
+        print(f"  History File: {self.history_file}")
+
+        if self.current_convo:
+            print(f"  Current Conversation: {self.current_convo}")
+        else:
+            print("  Current Conversation: None")
+
+        if self.current_prompts:
+            print(f"  Active Prompts: {len(self.current_prompts)}")
+            for prompt in self.current_prompts:
+                print(f"    - {prompt['name']} v{prompt['version']}")
+        else:
+            print("  Active Prompts: None")
+
+        if self.injected_files:
+            print(f"  Injected Files: {len(self.injected_files)}")
+            for injected in self.injected_files:
+                print(f"    - {injected['file']}")
+        else:
+            print("  Injected Files: None")
+
+    def show_status(self):
+        """Show current status."""
+        print(f"context: {self.current_context.relative_to(self.lab_root)}")
+        print(f"convo:   {self.current_convo or 'None'}")
+        if self.current_prompts:
+            prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.current_prompts])
+            print(f"prompts: {prompts_str}")
+        print(f"model:   {self.current_model} ({self.current_endpoint})")
+
+    def show_history(self):
+        """Show conversation history."""
+        if not self.current_convo:
+            print("No active conversation")
+            return
+
+        history = self.load_convo_history()
+        for msg in history:
+            if msg['role'] == 'user':
+                print(f"User: {msg['content']}")
+            elif msg['role'] == 'asst':
+                print(f"Assistant: {msg['content']}")
+            print()
     
     def run(self):
         """Main chat loop."""
@@ -153,10 +182,6 @@ class ChatCLI(Chat,Files,Commands):
         print("Type /help for commands, /quit to exit")
         print()
         
-        if self.get_pending_user_message():
-            print("Error: incomplete user turn found in conversation history; fix the convo files and restart")
-            sys.exit(1)
-
         # Inject initial files
         self.inject_files()
 
@@ -213,12 +238,9 @@ class ChatCLI(Chat,Files,Commands):
 
 def main():
     """Main entry point for the CLI."""
-    args = docopt(__doc__, version=f'Lab Infra Chat CLI {__version__}')
-    
+    args = docopt(__doc__, version='Lab Infra Chat CLI ' + __version__)
     config_path = args.get('--config')
-    
-    cli = ChatCLI(config_path)
-    cli.run()
+    ChatCLI(config_path).run()
 
 if __name__ == '__main__':
     main()
