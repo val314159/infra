@@ -77,7 +77,6 @@ import sys
 import uuid
 import yaml as pyyaml
 import json
-import readline
 import glob
 import subprocess
 import datetime
@@ -85,6 +84,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import openai
 from docopt import docopt
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import FileHistory
 
 class ChatCLI:
     # Unix permission constants (core architectural choices)
@@ -119,6 +121,7 @@ class ChatCLI:
         self.current_model = self.config['default_model']
         self.current_endpoint = self.config['default_endpoint']
         self.injected_files = []
+        self.retry_message: Optional[str] = ''
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
         self.last_injected_set: Optional[set] = None
@@ -135,7 +138,7 @@ class ChatCLI:
         # Ensure directories exist
         self.convos_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup history and readline
+        # Setup history and prompt tooling
         self.setup_history()
         self.setup_completion()
 
@@ -330,63 +333,51 @@ class ChatCLI:
         """Setup command line history persistence."""
         # History file path
         self.history_file = self.lab_home / '.cli-history'
-        
-        # Load existing history
-        if self.history_file.exists():
-            readline.read_history_file(str(self.history_file))
-        
-        # Set history length
-        readline.set_history_length(1000)
+        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        self.prompt_history = FileHistory(str(self.history_file))
+
+    def prompt_input(self, message: str = '', default: str = '') -> str:
+        return self.session.prompt(message, default=default)
 
     def append_history_line(self, line: str):
         if not line:
             return
-
         try:
             with open(self.history_file, 'a', encoding='utf-8') as f:
                 f.write(line.replace('\n', ' ') + '\n')
                 f.flush()
                 os.fsync(f.fileno())
                 return
-        except FileNotFoundError:
-            try:
-                self.history_file.parent.mkdir(parents=True, exist_ok=True)
-                readline.write_history_file(str(self.history_file))
-            except Exception:
-                # pass thru
-                pass
         except Exception:
-            # pass thru
-            pass
-        
-        # error condition
-        print(f"Warning: Failed to write history file: {self.history_file}")
-        return
+            print(f"Warning: Failed to write history file: {self.history_file}")
+            return
     
     def setup_completion(self):
-        """Setup readline tab completion."""
+        """Setup prompt-toolkit tab completion."""
         commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/show', '/help', '/quit']
-        
-        def completer(text, state):
-            options = []
-            if text.startswith('/'):
-                options = [cmd for cmd in commands if cmd.startswith(text)]
-            else:
-                # File completion for non-commands
+
+        class ChatCompleter(Completer):
+            def get_completions(self, document, complete_event):
+                text = document.text_before_cursor
+                if text.startswith('/'):
+                    for cmd in commands:
+                        if cmd.startswith(text):
+                            yield Completion(cmd, start_position=-len(text))
+                    return
+
                 try:
-                    path = str(self.current_context)
+                    path = str(self_outer.current_context)
                     files = glob.glob(os.path.join(path, text + '*'))
-                    options = [os.path.basename(f) for f in files if os.path.isfile(f)]
+                    for file_path in files:
+                        if os.path.isfile(file_path):
+                            basename = os.path.basename(file_path)
+                            yield Completion(basename, start_position=-len(text))
                 except Exception:
                     print(f"Warning: Failed to list files in {path}")
-                    pass
-            
-            if state < len(options):
-                return options[state]
-            return None
-        
-        readline.set_completer(completer)
-        readline.parse_and_bind('tab: complete')
+
+        self_outer = self
+        self.prompt_completer = ChatCompleter()
+        self.session = PromptSession(history=self.prompt_history, completer=self.prompt_completer)
     
     def get_convo_path(self, convo_id: str) -> Path:
         """Get path to conversation directory."""
@@ -697,6 +688,27 @@ class ChatCLI:
         context_parts.append("")
         
         return "\n".join(context_parts)
+
+    def get_pending_user_message(self) -> Optional[str]:
+        if not self.current_convo:
+            return None
+
+        history = self.load_convo_history()
+        if not history:
+            return None
+
+        last = history[-1]
+        if not isinstance(last, dict):
+            return None
+
+        if last.get('role') != 'user':
+            return None
+
+        content = last.get('content')
+        if not isinstance(content, str):
+            return None
+
+        return content
     
     def send_message(self, message: str) -> str:
         """Send a message to the AI and get response."""
@@ -706,14 +718,18 @@ class ChatCLI:
         self.refresh_injected_files(notify=True, record_meta=True)
         
         convo_dir = self.get_convo_path(self.current_convo)
+
+        pending_message = self.retry_message
+        retry_this_turn = bool(pending_message is not None and pending_message == message)
+        self.retry_message = ''
         
-        # Write user message
-        user_msg = [{
-            'role': 'user',
-            'content': message,
-            'timestamp': datetime.datetime.now().isoformat() + 'Z'
-        }]
-        self.write_convo_file(convo_dir, user_msg, 'user')
+        if not retry_this_turn:
+            user_msg = [{
+                'role': 'user',
+                'content': message,
+                'timestamp': datetime.datetime.now().isoformat() + 'Z'
+            }]
+            self.write_convo_file(convo_dir, user_msg, 'user')
         
         # Build full context
         full_context = self.build_context()
@@ -731,7 +747,8 @@ class ChatCLI:
                 messages.append({'role': msg['role'], 'content': msg['content']})
         
         # Add current message
-        messages.append({'role': 'user', 'content': message})
+        if not retry_this_turn:
+            messages.append({'role': 'user', 'content': message})
         
         # Get AI response
         try:
@@ -1150,6 +1167,13 @@ class ChatCLI:
         
         # Inject initial files
         self.inject_files()
+
+        pending_message = self.get_pending_user_message()
+        if pending_message is not None:
+            self.retry_message = pending_message
+            print("Pending user message detected; press Enter to retry or edit before sending")
+        else:
+            self.retry_message = ''
         
         while True:
             try:
@@ -1158,8 +1182,8 @@ class ChatCLI:
                 print(f"\n{status}")
                 
                 # Get input
-                line = input(">>> ").strip()
-                
+                line = self.prompt_input(">>> ", default=self.retry_message).strip()
+
                 if not line:
                     continue
 
