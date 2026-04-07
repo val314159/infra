@@ -1,0 +1,8 @@
+TODO
+
+ - get rid of the retry logic
+- inject files twice at startup?
+- should /inject have its own list?  why not just use injected.?
+- take out /inject for now, just use the inject file
+- rexamine ~/.lab 
+- ../.. is brittle

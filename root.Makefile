@@ -8,3 +8,5 @@ clean::
 
 realclean:: clean
 	@make -C infra $@
+reset:
+	rm -fr ~/.lab infra/convos/[0-9a-z]* ideas/cli/convos
