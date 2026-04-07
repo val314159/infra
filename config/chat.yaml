@@ -1,5 +1,0 @@
-default_model: firmen102/qwen3.5-27b
-default_endpoint: ollama
-endpoints:
-  ollama:
-    url: http://n:11434/v1
