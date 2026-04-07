@@ -134,11 +134,10 @@ class ChatCLI:
     def __init__(self, config_path: str = None):
         self.config = self.load_config(config_path)
 
-        # Use current directory as context (no lab_root concept)
         self.current_context = Path.cwd()
-        self.convos_dir = Path.home() / '.lab' / 'convos'
-        self.prompts_dir = Path.home() / '.lab' / 'prompts'
-        self.state_file = Path.home() / '.lab' / 'chat_state.json'
+        self.convos_dir = self.lab_home / 'convos'
+        self.prompts_dir = self.lab_home / 'prompts'
+        self.state_file = self.lab_home / 'chat_state.json'
         self.first_convo: Optional[str] = None
         
         # Current state
@@ -238,13 +237,16 @@ class ChatCLI:
             'default_model': 'firmen102/qwen3.5-27b',
             'default_endpoint': 'ollama',
             'endpoints': {
+                'openai': {
+                    'url': 'https://api.openai.com/v1',
+                    'key_env': 'OPENAI_API_KEY'
+                },
                 'ollama': {
-                    'url': 'http://localhost:11434/v1'
+                    'url': 'http://localhost:11434/v1',
+                    'key_env': 'dummy'
                 }
             },
-            'conversation_store': '.lab/convos',
-            'prompt_library': '.lab/prompts',
-            'auto_inject_makefile': True,
+            'auto_inject_makefile': True,   
             'restore_last_convo': True
         }
 
@@ -262,7 +264,7 @@ class ChatCLI:
             try:
                 self.ensure_dir(self.lab_home)
                 with open(user_config_path, 'w') as f:
-                    pyyaml.dump(default_config, f, indent=2, sort_keys=True)
+                    pyyaml.dump(default_config, f, indent=2)
                 print(f"Created default config at: {user_config_path}")
             except Exception:
                 print(f"Warning: Failed to create default config at {user_config_path}")
@@ -282,10 +284,15 @@ class ChatCLI:
         """Setup OpenAI client for current endpoint."""
         endpoint_config = self.config['endpoints'][self.current_endpoint]
         
-        if self.current_endpoint == 'openai':
-            api_key = os.getenv(endpoint_config['key_env'])
+        endpoint_key = endpoint_config['key_env']
+        if endpoint_key.isupper():
+            api_key = os.getenv(endpoint_key)
             if not api_key:
-                raise ValueError(f"Missing {endpoint_config['key_env']} environment variable")
+                raise ValueError(f"Missing {endpoint_key} environment variable")
+        else:
+            api_key = endpoint_key
+
+        if self.current_endpoint == 'openai':
             self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
         else:
             # Local endpoint (Ollama)
@@ -321,8 +328,8 @@ class ChatCLI:
                     
                     try:
                         if cmd == '/switch':
-                            # Complete directories from lab_root
-                            base_path = self_outer.lab_root
+                            # Complete directories from current working directory
+                            base_path = Path.cwd()
                             for item in base_path.glob(current_arg + '*'):
                                 if item.is_dir():
                                     rel_path = str(item.relative_to(base_path))
@@ -337,9 +344,17 @@ class ChatCLI:
                                 for item in base_path.glob(search_pattern):
                                     rel_path = './' + str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
+                            elif current_arg.startswith('/'):
+                                # Absolute path completion
+                                if '/' in current_arg:
+                                    base_path = Path(current_arg).parent
+                                    search_pattern = Path(current_arg).name + '*'
+                                    if base_path.exists():
+                                        for item in base_path.glob(search_pattern):
+                                            yield Completion(str(item), start_position=start_pos)
                             else:
-                                # Lab root relative
-                                base_path = self_outer.lab_root
+                                # Relative to current working directory
+                                base_path = Path.cwd()
                                 for item in base_path.glob(current_arg + '*'):
                                     rel_path = str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
@@ -442,7 +457,7 @@ class ChatCLI:
         # Add injected files
         for injected in self.get_injected_files():
             context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
-            full_path = self.lab_root / injected['file']
+            full_path = Path(injected['file'])
             try:
                 with open(full_path, 'r') as f:
                     context_parts.append(f.read())
