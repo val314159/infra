@@ -94,13 +94,6 @@ class ChatCLI:
     PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
     PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
 
-    def get_lab_relative_path(self, path: Path) -> str:
-        """Get path relative to lab_root, fallback to absolute if outside."""
-        try:
-            return str(path.relative_to(self.lab_root))
-        except ValueError:
-            return str(path.resolve())
-    
     def ensure_dir(self, path: Path) -> None:
         """Ensure directory exists."""
         path.mkdir(parents=True, exist_ok=True)
@@ -141,14 +134,14 @@ class ChatCLI:
     def __init__(self, config_path: str = None):
         self.config = self.load_config(config_path)
 
-        self.lab_root = Path(self.config['lab_root']).expanduser()
-        self.convos_dir = Path(self.config['conversation_store'])
-        self.prompts_dir = Path(self.config['prompt_library'])
-        self.state_file = self.lab_home / 'chat_state.json'
+        # Use current directory as context (no lab_root concept)
+        self.current_context = Path.cwd()
+        self.convos_dir = Path.home() / '.lab' / 'convos'
+        self.prompts_dir = Path.home() / '.lab' / 'prompts'
+        self.state_file = Path.home() / '.lab' / 'chat_state.json'
         self.first_convo: Optional[str] = None
         
         # Current state
-        self.current_context = self.lab_root
         self.current_convo = None
         self.current_prompts = []
         self.current_model = self.config['default_model']
@@ -170,32 +163,18 @@ class ChatCLI:
         self.setup_history()
         self.setup_completion()
 
-    def is_valid_context(self, context_path: Path) -> bool:
-        try:
-            context_resolved = context_path.resolve()
-            lab_root_resolved = self.lab_root.resolve()
-        except Exception:
-            print(f"Warning: Failed to resolve paths for context validation: {context_path}")
-            return False
-
-        if context_resolved == lab_root_resolved:
-            return True
-
-        return lab_root_resolved in context_resolved.parents
-
     def load_user_state(self):
         state = self.load_json_file(self.state_file)
         if state is None:
             return
 
         ctx = state.get('last_context')
-
         if isinstance(ctx, str):
             candidate = Path(ctx)
             if not candidate.is_absolute():
-                candidate = self.lab_root / candidate
+                candidate = Path.cwd() / ctx
 
-            if candidate.exists() and candidate.is_dir() and self.is_valid_context(candidate):
+            if candidate.exists() and candidate.is_dir():
                 self.current_context = candidate
 
         fc = state.get('first_convo')
@@ -204,7 +183,6 @@ class ChatCLI:
 
     def save_user_state(self):
         state = {
-            'lab_root': str(self.lab_root.resolve()),
             'last_context': str(self.current_context.resolve()),
             'first_convo': self.first_convo,
             'saved_at': datetime.datetime.now().isoformat() + 'Z',
@@ -255,45 +233,49 @@ class ChatCLI:
 
     def load_config(self, config_path: str = None) -> Dict:
         """Load configuration from YAML file with defaults."""
-
-        cur_dir = os.getcwd()
-
         # Default configuration
         default_config = {
             'default_model': 'firmen102/qwen3.5-27b',
             'default_endpoint': 'ollama',
             'endpoints': {
-                'openai': {
-                    'url': 'https://api.openai.com/v1',
-                    'key_env': 'OPENAI_API_KEY'
-                },
                 'ollama': {
-                    'url': 'http://localhost:11434/v1',
-                    'key_env': None
-                },
-                'vllm': {
-                    'url': 'http://localhost:8000/v1',
-                    'key_env': None
+                    'url': 'http://localhost:11434/v1'
                 }
             },
-            'lab_root': cur_dir,
-            'conversation_store': 'infra/convos',
-            'prompt_library': 'infra/prompts',
-            'auto_inject_makefile': True
+            'conversation_store': '.lab/convos',
+            'prompt_library': '.lab/prompts',
+            'auto_inject_makefile': True,
+            'restore_last_convo': True
         }
+
+        # Load user config from ~/.lab/config.yaml
+        user_config_path = self.lab_home / 'config.yaml'
+        if user_config_path.exists():
+            try:
+                with open(user_config_path, 'r') as f:
+                    loaded_config = pyyaml.safe_load(f)
+                default_config.update(loaded_config)
+            except Exception:
+                print(f"Warning: Failed to load config from {user_config_path}")
+        else:
+            # Write default config so user can see what's available
+            try:
+                self.ensure_dir(self.lab_home)
+                with open(user_config_path, 'w') as f:
+                    pyyaml.dump(default_config, f, indent=2, sort_keys=True)
+                print(f"Created default config at: {user_config_path}")
+            except Exception:
+                print(f"Warning: Failed to create default config at {user_config_path}")
         
-        if config_path is None:
-            # reasonable default
-            config_path = Path(cur_dir) / 'infra' / 'config' / 'chat.yaml'
+        # Override with explicit config path if provided
+        if config_path and os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    loaded_config = pyyaml.safe_load(f)
+                default_config.update(loaded_config)
+            except Exception:
+                print(f"Warning: Failed to load config from {config_path}")
         
-        # Load config file if it exists
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                loaded_config = pyyaml.safe_load(f)
-            # Merge with defaults (loaded config takes precedence)
-            default_config.update(loaded_config)
-        print("CONFIG")
-        print(json.dumps(default_config))
         return default_config
     
     def setup_openai(self):
@@ -308,26 +290,6 @@ class ChatCLI:
         else:
             # Local endpoint (Ollama)
             self.client = openai.OpenAI(base_url=endpoint_config['url'], api_key='not-needed')
-    
-    def setup_history(self):
-        """Setup command line history persistence."""
-        # History file path
-        self.history_file = self.lab_home / '.cli-history'
-        self.ensure_dir(self.history_file.parent)
-        self.prompt_history = FileHistory(str(self.history_file))
-
-    def append_history_line(self, line: str):
-        if not line:
-            return
-        try:
-            with open(self.history_file, 'a', encoding='utf-8') as f:
-                f.write(line.replace('\n', ' ') + '\n')
-                f.flush()
-                os.fsync(f.fileno())
-                return
-        except Exception:
-            print(f"Warning: Failed to write history file: {self.history_file}")
-            return
     
     def setup_completion(self):
         """Setup prompt-toolkit tab completion."""
@@ -391,6 +353,26 @@ class ChatCLI:
         self.prompt_completer = ChatCompleter()
         self.session = PromptSession(history=self.prompt_history, completer=self.prompt_completer)
     
+    def setup_history(self):
+        """Setup command line history persistence."""
+        # History file path
+        self.history_file = self.lab_home / '.cli-history'
+        self.ensure_dir(self.history_file.parent)
+        self.prompt_history = FileHistory(str(self.history_file))
+
+    def append_history_line(self, line: str):
+        if not line:
+            return
+        try:
+            with open(self.history_file, 'a', encoding='utf-8') as f:
+                f.write(line.replace('\n', ' ') + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+                return
+        except Exception:
+            print(f"Warning: Failed to write history file: {self.history_file}")
+            return
+
     def get_convo_path(self, convo_id: str) -> Path:
         """Get path to conversation directory."""
         return self.convos_dir / convo_id
@@ -422,7 +404,7 @@ class ChatCLI:
         return f"{max_num + 1:04d}"
 
     def build_meta_state(self, *, include_title: bool = False, title: Optional[str] = None, convo_id: Optional[str] = None) -> Dict[str, Any]:
-        context_rel = self.get_lab_relative_path(self.current_context)
+        context_rel = str(self.current_context)
 
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
@@ -471,7 +453,7 @@ class ChatCLI:
         
         # Add context info
         context_parts.append(f"=== CURRENT CONTEXT ===")
-        context_parts.append(f"Directory: {self.get_lab_relative_path(self.current_context)}")
+        context_parts.append(f"Directory: {self.current_context}")
         context_parts.append(f"Conversation: {self.current_convo or 'None'}")
         context_parts.append(f"Model: {self.current_model} ({self.current_endpoint})")
         context_parts.append("")
@@ -532,26 +514,26 @@ class ChatCLI:
                     if line.startswith('./'):
                         # Context-relative: ./main.py
                         full_path = base_context / line[2:]
-                        stored_path = self.get_lab_relative_path(full_path)
+                        stored_path = str(full_path)
                     elif line.startswith('/'):
-                        # Absolute path: /Users/val/lab/ideas/cli/main.py
+                        # Absolute path: /Users/val/project/main.py
                         abs_path = Path(line)
                         if abs_path.exists():
-                            try:
-                                stored_path = self.get_lab_relative_path(abs_path)
-                            except ValueError:
-                                # Absolute path is outside lab_root, reject it
-                                print(f"Warning: Absolute path {line} is outside lab_root, skipping")
-                                continue
+                            stored_path = str(abs_path)
                         else:
                             print(f"Warning: Absolute path {line} does not exist, skipping")
                             continue
                     else:
-                        # Lab-root relative: ideas/cli/main.py
-                        stored_path = line
+                        # Relative to current working directory: ideas/cli/main.py
+                        full_path = Path.cwd() / line
+                        if full_path.exists():
+                            stored_path = str(full_path)
+                        else:
+                            print(f"Warning: Path {line} does not exist, skipping")
+                            continue
                     
                     # Check file existence and duplicates
-                    if (self.lab_root / stored_path).exists():
+                    if Path(stored_path).exists():
                         if not check_duplicates or stored_path not in seen:
                             injected_files.append({
                                 'file': stored_path,
@@ -572,7 +554,7 @@ class ChatCLI:
             makefile_path = self.current_context / 'Makefile'
             if makefile_path.exists():
                 injected_files.append({
-                    'file': self.get_lab_relative_path(makefile_path),
+                    'file': str(makefile_path),
                     'injected_at': datetime.datetime.now().isoformat() + 'Z'
                 })
 
@@ -899,13 +881,12 @@ class ChatCLI:
     def handle_switch(self, args: List[str]):
         """Handle context switching."""
         if not args:
-            # List available contexts
+            # List available contexts (subdirectories of current directory)
             print("Available contexts:")
-            for item in self.lab_root.iterdir():
+            for item in Path.cwd().iterdir():
                 if item.is_dir() and not item.name.startswith('.'):
-                    rel_path = item.relative_to(self.lab_root)
                     marker = " (current)" if item == self.current_context else ""
-                    print(f"  {rel_path}{marker}")
+                    print(f"  {item.name}{marker}")
             return
         
         if args[0] == 'list':
@@ -914,16 +895,16 @@ class ChatCLI:
         
         # Switch to specific context
         old_convo = self.current_convo
-        old_context_rel = self.get_lab_relative_path(self.current_context)
+        old_context_rel = str(self.current_context)
 
-        new_context = self.lab_root / args[0]
+        new_context = Path.cwd() / args[0]
         if new_context.exists() and new_context.is_dir():
             self.current_context = new_context
             self.load_context_state()
             self.save_user_state()
 
             new_convo = self.current_convo
-            new_context_rel = self.get_lab_relative_path(self.current_context)
+            new_context_rel = str(self.current_context)
 
             if old_convo:
                 leave_meta: Dict[str, Any] = {
@@ -935,7 +916,7 @@ class ChatCLI:
                 }
                 old_convo_dir = self.get_convo_path(old_convo)
                 self.write_convo_file(old_convo_dir, leave_meta, 'meta')
-            print(f"Switched to context: {self.get_lab_relative_path(new_context)}")
+            print(f"Switched to context: {new_context}")
         else:
             print(f"Context '{args[0]}' not found")
     
@@ -1041,11 +1022,11 @@ class ChatCLI:
             if file_path.startswith('./'):
                 # Current context relative (./main.py)
                 full_path = self.current_context / file_path[2:]
-                stored_path = self.get_lab_relative_path(full_path)
+                stored_path = str(full_path)
             else:
-                # Lab root relative (ideas/cli/main.py) - current behavior
-                full_path = self.lab_root / file_path
-                stored_path = file_path
+                # Relative to current working directory (ideas/cli/main.py)
+                full_path = Path.cwd() / file_path
+                stored_path = str(full_path)
                 
             if full_path.exists():
                 # Append to local.injected.txt using shared save function
@@ -1088,8 +1069,7 @@ class ChatCLI:
         """Show current configuration."""
         print("Current Configuration:")
         print(f"  Model: {self.current_model} ({self.current_endpoint})")
-        print(f"  Lab Root: {self.lab_root}")
-        print(f"  Context: {self.get_lab_relative_path(self.current_context)}")
+        print(f"  Context: {self.current_context}")
         print(f"  Conversation Store: {self.convos_dir}")
         print(f"  Prompt Library: {self.prompts_dir}")
         print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
@@ -1117,7 +1097,7 @@ class ChatCLI:
 
     def show_status(self):
         """Show current status."""
-        print(f"context: {self.get_lab_relative_path(self.current_context)}")
+        print(f"context: {self.current_context}")
         print(f"convo:   {self.current_convo or 'None'}")
         if self.current_prompts:
             prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.current_prompts])
@@ -1150,7 +1130,7 @@ class ChatCLI:
     def get_status_line(self) -> str:
         """Generate status line for display."""
         parts = []
-        parts.append(f"context: {self.get_lab_relative_path(self.current_context)}")
+        parts.append(f"context: {self.current_context}")
         
         if self.current_convo:
             convo_dir = self.get_convo_path(self.current_convo)
