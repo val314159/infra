@@ -152,9 +152,6 @@ class ChatCLI:
         self.load_user_state()
         self.load_context_state()
         
-        # Setup OpenAI client
-        self.setup_openai()
-        
         # Ensure directories exist
         self.ensure_dir(self.convos_dir)
         
@@ -162,6 +159,13 @@ class ChatCLI:
         self.setup_history()
         self.setup_completion()
 
+        # Setup OpenAI client
+        endpoint_config = self.config['endpoints'][self.current_endpoint]        
+        if (api_key := endpoint_config['key_env']).isupper():
+            if not (api_key := os.getenv(api_key)):
+                raise ValueError(f"Missing {api_key} environment variable")
+        self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
+        
     def load_user_state(self):
         state = self.load_json_file(self.state_file)
         if state is None:
@@ -279,24 +283,6 @@ class ChatCLI:
                 print(f"Warning: Failed to load config from {config_path}")
         
         return default_config
-    
-    def setup_openai(self):
-        """Setup OpenAI client for current endpoint."""
-        endpoint_config = self.config['endpoints'][self.current_endpoint]
-        
-        endpoint_key = endpoint_config['key_env']
-        if endpoint_key.isupper():
-            api_key = os.getenv(endpoint_key)
-            if not api_key:
-                raise ValueError(f"Missing {endpoint_key} environment variable")
-        else:
-            api_key = endpoint_key
-
-        if self.current_endpoint == 'openai':
-            self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
-        else:
-            # Local endpoint (Ollama)
-            self.client = openai.OpenAI(base_url=endpoint_config['url'], api_key='not-needed')
     
     def setup_completion(self):
         """Setup prompt-toolkit tab completion."""
