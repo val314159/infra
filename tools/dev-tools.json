@@ -1,0 +1,153 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "git_status",
+      "description": "Get git repository status",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the git repository (defaults to current directory)",
+            "default": "."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "git_diff",
+      "description": "Show git diff for changes",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the git repository (defaults to current directory)",
+            "default": "."
+          },
+          "file": {
+            "type": "string",
+            "description": "Specific file to show diff for (optional)"
+          },
+          "staged": {
+            "type": "boolean",
+            "description": "Show staged changes instead of working directory",
+            "default": false
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "git_log",
+      "description": "Show git commit history",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the git repository (defaults to current directory)",
+            "default": "."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Number of commits to show (default: 10)",
+            "default": 10
+          },
+          "file": {
+            "type": "string",
+            "description": "Show history for specific file (optional)"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_tests",
+      "description": "Run project tests (detects common test frameworks)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "framework": {
+            "type": "string",
+            "description": "Test framework to use (auto, pytest, jest, cargo, etc.)",
+            "default": "auto"
+          },
+          "path": {
+            "type": "string",
+            "description": "Path to run tests from (defaults to current directory)",
+            "default": "."
+          },
+          "args": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Additional arguments to pass to test runner"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "npm_install",
+      "description": "Install npm packages",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "packages": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Packages to install (empty array installs all dependencies)"
+          },
+          "dev": {
+            "type": "boolean",
+            "description": "Install as dev dependencies",
+            "default": false
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "lint_code",
+      "description": "Run code linting (detects common linters)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "linter": {
+            "type": "string",
+            "description": "Linter to use (auto, eslint, flake8, pylint, etc.)",
+            "default": "auto"
+          },
+          "path": {
+            "type": "string",
+            "description": "Path to lint (defaults to current directory)",
+            "default": "."
+          },
+          "fix": {
+            "type": "boolean",
+            "description": "Automatically fix linting issues when possible",
+            "default": false
+          }
+        },
+        "required": []
+      }
+    }
+  }
+]

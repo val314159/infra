@@ -1,0 +1,152 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "shell_command",
+      "description": "Execute a shell command",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory for command execution",
+            "default": "."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Command timeout in seconds (default: 30)",
+            "default": 30
+          },
+          "capture_output": {
+            "type": "boolean",
+            "description": "Capture and return command output",
+            "default": true
+          }
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "process_info",
+      "description": "Get information about running processes",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Filter processes by name or pattern"
+          },
+          "pid": {
+            "type": "integer",
+            "description": "Get info for specific process ID"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "system_info",
+      "description": "Get system information (CPU, memory, disk, etc.)",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Type of system info (cpu, memory, disk, network, all)",
+            "default": "all"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "find_files",
+      "description": "Find files matching criteria",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to search in",
+            "default": "."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "File name pattern (glob syntax)"
+          },
+          "content": {
+            "type": "string",
+            "description": "Search within file contents"
+          },
+          "file_type": {
+            "type": "string",
+            "description": "File type filter (f for file, d for directory)"
+          },
+          "max_depth": {
+            "type": "integer",
+            "description": "Maximum directory depth to search"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "disk_usage",
+      "description": "Get disk usage information",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to check disk usage for",
+            "default": "."
+          },
+          "human_readable": {
+            "type": "boolean",
+            "description": "Show sizes in human readable format",
+            "default": true
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "network_info",
+      "description": "Get network configuration and status",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "interface": {
+            "type": "string",
+            "description": "Specific network interface to check"
+          },
+          "type": {
+            "type": "string",
+            "description": "Type of network info (interfaces, connections, routes, all)",
+            "default": "all"
+          }
+        },
+        "required": []
+      }
+    }
+  }
+]
