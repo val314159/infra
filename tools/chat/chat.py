@@ -94,6 +94,39 @@ class ChatCLI:
     PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
     PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
 
+    def get_lab_relative_path(self, path: Path) -> str:
+        """Get path relative to lab_root, fallback to absolute if outside."""
+        try:
+            return str(path.relative_to(self.lab_root))
+        except ValueError:
+            return str(path.resolve())
+    
+    def ensure_dir(self, path: Path) -> None:
+        """Ensure directory exists."""
+        path.mkdir(parents=True, exist_ok=True)
+    
+    def load_json_file(self, file_path: Path, default: Any = None) -> Any:
+        """Load JSON file with default and error handling."""
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return default
+        except Exception:
+            print(f"Warning: Failed to load {file_path}")
+            return default
+    
+    def save_json_file(self, file_path: Path, data: Any) -> bool:
+        """Save JSON file with error handling."""
+        try:
+            self.ensure_dir(file_path.parent)
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            return True
+        except Exception:
+            print(f"Warning: Failed to save {file_path}")
+            return False
+
     @property
     def lab_home(self) -> Path:
         return Path.home() / '.lab'
@@ -131,7 +164,7 @@ class ChatCLI:
         self.setup_openai()
         
         # Ensure directories exist
-        self.convos_dir.mkdir(parents=True, exist_ok=True)
+        self.ensure_dir(self.convos_dir)
         
         # Setup history and prompt tooling
         self.setup_history()
@@ -151,14 +184,8 @@ class ChatCLI:
         return lab_root_resolved in context_resolved.parents
 
     def load_user_state(self):
-        try:
-            with open(self.state_file, 'r') as f:
-                state = json.load(f)
-        except FileNotFoundError:
-            # do nothing
-            return
-        except Exception:
-            print(f"Warning: Failed to load state file: {self.state_file}")
+        state = self.load_json_file(self.state_file)
+        if state is None:
             return
 
         ctx = state.get('last_context')
@@ -176,48 +203,31 @@ class ChatCLI:
             self.first_convo = fc
 
     def save_user_state(self):
-        try:
-            self.lab_home.mkdir(parents=True, exist_ok=True)
-            state = {
-                'lab_root': str(self.lab_root.resolve()),
-                'last_context': str(self.current_context.resolve()),
-                'first_convo': self.first_convo,
-                'saved_at': datetime.datetime.now().isoformat() + 'Z',
-            }
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2, sort_keys=True)
-        except Exception:
-            print(f"Warning: Failed to save state file: {self.state_file}")
-            return
+        state = {
+            'lab_root': str(self.lab_root.resolve()),
+            'last_context': str(self.current_context.resolve()),
+            'first_convo': self.first_convo,
+            'saved_at': datetime.datetime.now().isoformat() + 'Z',
+        }
+        self.save_json_file(self.state_file, state)
 
     def load_context_state(self):
         context_state_file = self.get_context_state_file()
         
-        try:
-            with open(context_state_file, 'r') as f:
-                state = json.load(f)
-        except FileNotFoundError:
-            self.current_context_state = {}
-            self.current_convo = None
-            return
-        except Exception:
-            print(f"Warning: Failed to load context state file: {context_state_file}")
-            self.current_context_state = {}
-            self.current_convo = None
-            return
-
+        state = self.load_json_file(context_state_file, {})
         if not isinstance(state, dict):
             state = {}
 
         self.current_context_state = state
 
-        if not self.restore_last_convo:
-            self.current_convo = None
-            return
+        # Find last conversation for this context
+        last_convo = state.get('last_convo')
+        if isinstance(last_convo, str) and last_convo:
+            candidates = [last_convo]
+        else:
+            candidates = []
 
-        candidates = [
-            state.get('last_convo'),
-        ]
+        # Try to find a valid conversation
         selected = None
         for candidate in candidates:
             if isinstance(candidate, str) and candidate:
@@ -229,15 +239,9 @@ class ChatCLI:
         self.current_convo = selected
 
     def save_context_state(self):
-        try:
-            context_convos_dir = self.get_context_convos_dir()
-            context_convos_dir.mkdir(parents=True, exist_ok=True)
-            context_state_file = self.get_context_state_file()
-            with open(context_state_file, 'w') as f:
-                json.dump(self.current_context_state, f, indent=2, sort_keys=True)
-        except Exception:
-            print(f"Warning: Failed to save context state file: {context_state_file}")
-            return
+        context_convos_dir = self.get_context_convos_dir()
+        context_state_file = self.get_context_state_file()
+        self.save_json_file(context_state_file, self.current_context_state)
 
     def set_context_convo(self, convo_id: Optional[str]):
         self.current_convo = convo_id
@@ -309,11 +313,8 @@ class ChatCLI:
         """Setup command line history persistence."""
         # History file path
         self.history_file = self.lab_home / '.cli-history'
-        self.history_file.parent.mkdir(parents=True, exist_ok=True)
+        self.ensure_dir(self.history_file.parent)
         self.prompt_history = FileHistory(str(self.history_file))
-
-    def prompt_input(self, message: str = '', default: str = '') -> str:
-        return self.session.prompt(message, default=default)
 
     def append_history_line(self, line: str):
         if not line:
@@ -419,23 +420,9 @@ class ChatCLI:
         
         max_num = max(numbers)
         return f"{max_num + 1:04d}"
-    
-    def write_convo_file(self, convo_dir: Path, content: Any, file_type: str):
-        """Write a conversation file and make it immutable."""
-        filename = f"{self.get_next_file_number(convo_dir)}-{file_type}.yaml"
-        filepath = convo_dir / filename
-        
-        with open(filepath, 'w') as f:
-            pyyaml.dump(content, f, default_flow_style=False)
-
-        # Make immutable
-        os.chmod(filepath, self.PERM_IMMUTABLE)
 
     def build_meta_state(self, *, include_title: bool = False, title: Optional[str] = None, convo_id: Optional[str] = None) -> Dict[str, Any]:
-        try:
-            context_rel = str(self.current_context.relative_to(self.lab_root))
-        except ValueError:
-            context_rel = str(self.current_context.resolve())
+        context_rel = self.get_lab_relative_path(self.current_context)
 
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
@@ -459,6 +446,56 @@ class ChatCLI:
                 payload['title'] = title
 
         return payload
+
+    def build_context(self) -> str:
+        """Build the full context for the AI."""
+        context_parts = []
+        
+        # Add prompts
+        for prompt in self.current_prompts:
+            context_parts.append(f"=== PROMPT: {prompt['name']} v{prompt['version']} ===")
+            context_parts.append(prompt['snapshot'])
+            context_parts.append("")
+        
+        # Add injected files
+        for injected in self.get_injected_files():
+            context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
+            full_path = self.lab_root / injected['file']
+            try:
+                with open(full_path, 'r') as f:
+                    context_parts.append(f.read())
+            except Exception as e:
+                context_parts.append(f"Error reading injected file: {e}")
+            context_parts.append("</injected>")
+            context_parts.append("")
+        
+        # Add context info
+        context_parts.append(f"=== CURRENT CONTEXT ===")
+        context_parts.append(f"Directory: {self.get_lab_relative_path(self.current_context)}")
+        context_parts.append(f"Conversation: {self.current_convo or 'None'}")
+        context_parts.append(f"Model: {self.current_model} ({self.current_endpoint})")
+        context_parts.append("")
+        
+        return "\n".join(context_parts)
+
+    def write_convo_file(self, convo_dir: Path, content: Any, file_type: str):
+        """Write a conversation file and make it immutable."""
+        filename = f"{self.get_next_file_number(convo_dir)}-{file_type}.yaml"
+        filepath = convo_dir / filename
+        
+        with open(filepath, 'w') as f:
+            pyyaml.dump(content, f, default_flow_style=False)
+
+        # Make immutable
+        os.chmod(filepath, self.PERM_IMMUTABLE)
+
+    def write_meta_update(self):
+        if not self.current_convo:
+            return
+
+        convo_dir = self.get_convo_path(self.current_convo)
+        meta = self.build_meta_state(convo_id=self.current_convo)
+        self.write_convo_file(convo_dir, meta, 'meta')
 
     def load_injected_file(self, file_path: Path, base_context: Path = None, check_duplicates: bool = False) -> List[Dict[str, Any]]:
         """Load injected files from a text file with # comments and ./ convention.
@@ -495,19 +532,20 @@ class ChatCLI:
                     if line.startswith('./'):
                         # Context-relative: ./main.py
                         full_path = base_context / line[2:]
-                        stored_path = str(full_path.relative_to(self.lab_root))
+                        stored_path = self.get_lab_relative_path(full_path)
                     elif line.startswith('/'):
                         # Absolute path: /Users/val/lab/ideas/cli/main.py
                         abs_path = Path(line)
                         if abs_path.exists():
                             try:
-                                stored_path = str(abs_path.relative_to(self.lab_root))
+                                stored_path = self.get_lab_relative_path(abs_path)
                             except ValueError:
                                 # Absolute path is outside lab_root, reject it
                                 print(f"Warning: Absolute path {line} is outside lab_root, skipping")
                                 continue
                         else:
-                            continue  # Absolute path doesn't exist
+                            print(f"Warning: Absolute path {line} does not exist, skipping")
+                            continue
                     else:
                         # Lab-root relative: ideas/cli/main.py
                         stored_path = line
@@ -534,7 +572,7 @@ class ChatCLI:
             makefile_path = self.current_context / 'Makefile'
             if makefile_path.exists():
                 injected_files.append({
-                    'file': str(makefile_path.relative_to(self.lab_root)),
+                    'file': self.get_lab_relative_path(makefile_path),
                     'injected_at': datetime.datetime.now().isoformat() + 'Z'
                 })
 
@@ -562,10 +600,12 @@ class ChatCLI:
             True if successful, False otherwise
         """
         try:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_dir(file_path.parent)
             
             if mode == 'append':
                 with open(file_path, 'a') as f:
+                    if header and not file_path.exists():
+                        f.write(f"{header}\n")
                     for injection in injections:
                         f.write(f"{injection}\n")
             else:  # write mode
@@ -578,14 +618,6 @@ class ChatCLI:
         except Exception:
             print(f"Warning: Failed to save injected file to {file_path}")
             return False
-
-    def write_meta_update(self):
-        if not self.current_convo:
-            return
-
-        convo_dir = self.get_convo_path(self.current_convo)
-        meta = self.build_meta_state(convo_id=self.current_convo)
-        self.write_convo_file(convo_dir, meta, 'meta')
     
     def create_convo(self, name: str = None) -> str:
         """Create a new conversation."""
@@ -662,37 +694,6 @@ class ChatCLI:
                 }
         
         raise ValueError(f"Invalid prompt format in {prompt_name}")
-    
-    def build_context(self) -> str:
-        """Build the full context for the AI."""
-        context_parts = []
-        
-        # Add prompts
-        for prompt in self.current_prompts:
-            context_parts.append(f"=== PROMPT: {prompt['name']} v{prompt['version']} ===")
-            context_parts.append(prompt['snapshot'])
-            context_parts.append("")
-        
-        # Add injected files
-        for injected in self.get_injected_files():
-            context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
-            full_path = self.lab_root / injected['file']
-            try:
-                with open(full_path, 'r') as f:
-                    context_parts.append(f.read())
-            except Exception as e:
-                context_parts.append(f"Error reading injected file: {e}")
-            context_parts.append("</injected>")
-            context_parts.append("")
-        
-        # Add context info
-        context_parts.append(f"=== CURRENT CONTEXT ===")
-        context_parts.append(f"Directory: {self.current_context.relative_to(self.lab_root)}")
-        context_parts.append(f"Conversation: {self.current_convo or 'None'}")
-        context_parts.append(f"Model: {self.current_model} ({self.current_endpoint})")
-        context_parts.append("")
-        
-        return "\n".join(context_parts)
 
     def get_pending_user_message(self) -> Optional[str]:
         if not self.current_convo:
@@ -794,7 +795,7 @@ class ChatCLI:
         
         return history
     
-    def handle_command(self, line: str) -> bool:
+    def dispatch_command(self, line: str) -> bool:
         """Handle slash commands. Returns True if command was handled."""
         if not line.startswith('/'):
             return False
@@ -895,37 +896,6 @@ class ChatCLI:
             print(f"Unknown show subcommand: {subcommand}")
             print("Available: config, status, history")
     
-    def show_config(self):
-        """Show current configuration."""
-        print("Current Configuration:")
-        print(f"  Model: {self.current_model} ({self.current_endpoint})")
-        print(f"  Lab Root: {self.lab_root}")
-        print(f"  Context: {self.current_context.relative_to(self.lab_root)}")
-        print(f"  Conversation Store: {self.convos_dir}")
-        print(f"  Prompt Library: {self.prompts_dir}")
-        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
-        print(f"  History File: {self.history_file}")
-        
-        if self.current_convo:
-            print(f"  Current Conversation: {self.current_convo}")
-        else:
-            print("  Current Conversation: None")
-        
-        if self.current_prompts:
-            print(f"  Active Prompts: {len(self.current_prompts)}")
-            for prompt in self.current_prompts:
-                print(f"    - {prompt['name']} v{prompt['version']}")
-        else:
-            print("  Active Prompts: None")
-        
-        injected_files = self.get_injected_files()
-        if injected_files:
-            print(f"  Injected Files: {len(injected_files)}")
-            for injected in injected_files:
-                print(f"    - {injected['file']}")
-        else:
-            print("  Injected Files: None")
-    
     def handle_switch(self, args: List[str]):
         """Handle context switching."""
         if not args:
@@ -944,12 +914,7 @@ class ChatCLI:
         
         # Switch to specific context
         old_convo = self.current_convo
-        old_context_rel = str(self.current_context.resolve())
-        try:
-            old_context_rel = str(self.current_context.relative_to(self.lab_root))
-        except Exception:
-            print(f"Warning: Failed to get relative path for {self.current_context}")
-            pass
+        old_context_rel = self.get_lab_relative_path(self.current_context)
 
         new_context = self.lab_root / args[0]
         if new_context.exists() and new_context.is_dir():
@@ -958,12 +923,7 @@ class ChatCLI:
             self.save_user_state()
 
             new_convo = self.current_convo
-            new_context_rel = str(self.current_context.resolve())
-            try:
-                new_context_rel = str(self.current_context.relative_to(self.lab_root))
-            except Exception:
-                print(f"Warning: Failed to get relative path for {self.current_context}")
-                pass
+            new_context_rel = self.get_lab_relative_path(self.current_context)
 
             if old_convo:
                 leave_meta: Dict[str, Any] = {
@@ -975,7 +935,7 @@ class ChatCLI:
                 }
                 old_convo_dir = self.get_convo_path(old_convo)
                 self.write_convo_file(old_convo_dir, leave_meta, 'meta')
-            print(f"Switched to context: {new_context.relative_to(self.lab_root)}")
+            print(f"Switched to context: {self.get_lab_relative_path(new_context)}")
         else:
             print(f"Context '{args[0]}' not found")
     
@@ -1081,7 +1041,7 @@ class ChatCLI:
             if file_path.startswith('./'):
                 # Current context relative (./main.py)
                 full_path = self.current_context / file_path[2:]
-                stored_path = str(full_path.relative_to(self.lab_root))
+                stored_path = self.get_lab_relative_path(full_path)
             else:
                 # Lab root relative (ideas/cli/main.py) - current behavior
                 full_path = self.lab_root / file_path
@@ -1123,10 +1083,41 @@ class ChatCLI:
         self.current_model = model_name
         self.write_meta_update()
         print(f"Switched to model: {model_name} ({self.current_endpoint})")
-    
+
+    def show_config(self):
+        """Show current configuration."""
+        print("Current Configuration:")
+        print(f"  Model: {self.current_model} ({self.current_endpoint})")
+        print(f"  Lab Root: {self.lab_root}")
+        print(f"  Context: {self.get_lab_relative_path(self.current_context)}")
+        print(f"  Conversation Store: {self.convos_dir}")
+        print(f"  Prompt Library: {self.prompts_dir}")
+        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
+        print(f"  History File: {self.history_file}")
+        
+        if self.current_convo:
+            print(f"  Current Conversation: {self.current_convo}")
+        else:
+            print("  Current Conversation: None")
+        
+        if self.current_prompts:
+            print(f"  Active Prompts: {len(self.current_prompts)}")
+            for prompt in self.current_prompts:
+                print(f"    - {prompt['name']} v{prompt['version']}")
+        else:
+            print("  Active Prompts: None")
+        
+        injected_files = self.get_injected_files()
+        if injected_files:
+            print(f"  Injected Files: {len(injected_files)}")
+            for injected in injected_files:
+                print(f"    - {injected['file']}")
+        else:
+            print("  Injected Files: None")
+
     def show_status(self):
         """Show current status."""
-        print(f"context: {self.current_context.relative_to(self.lab_root)}")
+        print(f"context: {self.get_lab_relative_path(self.current_context)}")
         print(f"convo:   {self.current_convo or 'None'}")
         if self.current_prompts:
             prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.current_prompts])
@@ -1159,7 +1150,7 @@ class ChatCLI:
     def get_status_line(self) -> str:
         """Generate status line for display."""
         parts = []
-        parts.append(f"context: {self.current_context.relative_to(self.lab_root)}")
+        parts.append(f"context: {self.get_lab_relative_path(self.current_context)}")
         
         if self.current_convo:
             convo_dir = self.get_convo_path(self.current_convo)
@@ -1188,9 +1179,6 @@ class ChatCLI:
         print("Type /help for commands, /quit to exit")
         print()
         
-        # Inject initial files
-        self.inject_files()
-
         pending_message = self.get_pending_user_message()
         if pending_message is not None:
             self.retry_message = pending_message
@@ -1205,7 +1193,7 @@ class ChatCLI:
                 print(f"\n{status}")
                 
                 # Get input
-                line = self.prompt_input(">>> ", default=self.retry_message).strip()
+                line = self.session.prompt(">>> ", default=self.retry_message).strip()
 
                 if not line:
                     continue
@@ -1234,7 +1222,7 @@ class ChatCLI:
                     continue
                 
                 # Handle commands
-                if self.handle_command(line):
+                if self.dispatch_command(line):
                     continue
                 
                 # Send message and show response
