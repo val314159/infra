@@ -108,7 +108,7 @@ class ChatCLI:
     def __init__(self, config_path: str = None):
         self.config = self.load_config(config_path)
 
-        self.lab_root = Path(self.config['lab_root'])
+        self.lab_root = Path(self.config['lab_root']).expanduser()
         self.convos_dir = Path(self.config['conversation_store'])
         self.prompts_dir = Path(self.config['prompt_library'])
         self.state_file = self.lab_home / 'chat_state.json'
@@ -120,17 +120,12 @@ class ChatCLI:
         self.current_prompts = []
         self.current_model = self.config['default_model']
         self.current_endpoint = self.config['default_endpoint']
-        self.injected_files = []
         self.retry_message: Optional[str] = ''
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
-        self.last_injected_set: Optional[set] = None
 
-        self.load_state()
+        self.load_user_state()
         self.load_context_state()
-        self.inject_files()
-        self.apply_manual_injections_from_context_state()
-        self.last_injected_set = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
         
         # Setup OpenAI client
         self.setup_openai()
@@ -155,7 +150,7 @@ class ChatCLI:
 
         return lab_root_resolved in context_resolved.parents
 
-    def load_state(self):
+    def load_user_state(self):
         try:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
@@ -180,7 +175,7 @@ class ChatCLI:
         if isinstance(fc, str) and fc:
             self.first_convo = fc
 
-    def save_state(self):
+    def save_user_state(self):
         try:
             self.lab_home.mkdir(parents=True, exist_ok=True)
             state = {
@@ -254,26 +249,6 @@ class ChatCLI:
 
         self.save_context_state()
 
-    def apply_manual_injections_from_context_state(self):
-        if not isinstance(getattr(self, 'current_context_state', None), dict):
-            return
-
-        manual = self.current_context_state.get('manual_inject')
-        if not isinstance(manual, list):
-            return
-
-        seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-        for file_path in manual:
-            if not isinstance(file_path, str):
-                continue
-            if file_path in seen:
-                continue
-            self.injected_files.append({
-                'file': file_path,
-                'injected_at': datetime.datetime.now().isoformat() + 'Z'
-            })
-            seen.add(file_path)
-    
     def load_config(self, config_path: str = None) -> Dict:
         """Load configuration from YAML file with defaults."""
 
@@ -313,7 +288,8 @@ class ChatCLI:
                 loaded_config = pyyaml.safe_load(f)
             # Merge with defaults (loaded config takes precedence)
             default_config.update(loaded_config)
-        
+        print("CONFIG")
+        print(json.dumps(default_config))
         return default_config
     
     def setup_openai(self):
@@ -359,21 +335,56 @@ class ChatCLI:
         class ChatCompleter(Completer):
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
-                if text.startswith('/'):
+                words = text.split()
+                
+                # No input - complete commands
+                if not text:
+                    for cmd in commands:
+                        yield Completion(cmd, start_position=0)
+                    return
+                
+                # Complete command names
+                if len(words) == 1 and text.startswith('/'):
                     for cmd in commands:
                         if cmd.startswith(text):
                             yield Completion(cmd, start_position=-len(text))
                     return
-
-                try:
-                    path = str(self_outer.current_context)
-                    files = glob.glob(os.path.join(path, text + '*'))
-                    for file_path in files:
-                        if os.path.isfile(file_path):
-                            basename = os.path.basename(file_path)
-                            yield Completion(basename, start_position=-len(text))
-                except Exception:
-                    print(f"Warning: Failed to list files in {path}")
+                
+                # Complete command arguments
+                if len(words) >= 2 and words[0].startswith('/'):
+                    cmd = words[0]
+                    current_arg = words[-1]
+                    start_pos = -len(current_arg)
+                    
+                    try:
+                        if cmd == '/switch':
+                            # Complete directories from lab_root
+                            base_path = self_outer.lab_root
+                            for item in base_path.glob(current_arg + '*'):
+                                if item.is_dir():
+                                    rel_path = str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                        
+                        elif cmd == '/inject':
+                            # Complete files and directories
+                            if current_arg.startswith('./'):
+                                # Current context relative
+                                base_path = self_outer.current_context
+                                search_pattern = current_arg[2:] + '*'
+                                for item in base_path.glob(search_pattern):
+                                    rel_path = './' + str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                            else:
+                                # Lab root relative
+                                base_path = self_outer.lab_root
+                                for item in base_path.glob(current_arg + '*'):
+                                    rel_path = str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                    
+                    except Exception:
+                        pass  # Silently fail completion
+                
+                return
 
         self_outer = self
         self.prompt_completer = ChatCompleter()
@@ -426,33 +437,17 @@ class ChatCLI:
         except ValueError:
             context_rel = str(self.current_context.resolve())
 
-        injected_yaml_mtime = None
-        try:
-            injected_yaml_path = self.current_context / 'injected.yaml'
-            if injected_yaml_path.exists():
-                injected_yaml_mtime = injected_yaml_path.stat().st_mtime
-        except Exception:
-            print(f"Warning: Failed to get mtime for {injected_yaml_path}")
-            injected_yaml_mtime = None
-
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
             'context': context_rel,
             'model': self.current_model,
             'endpoint': self.current_endpoint,
-            'injected_yaml_mtime': injected_yaml_mtime,
             'prompts': [
                 {
                     'prompt': prompt['name'],
                     'version': prompt['version'],
                     'snapshot': prompt['snapshot']
                 } for prompt in self.current_prompts
-            ],
-            'injected_files': [
-                {
-                    'file': injected['file'],
-                    'injected_at': injected.get('injected_at')
-                } for injected in self.injected_files
             ]
         }
 
@@ -465,9 +460,76 @@ class ChatCLI:
 
         return payload
 
-    def compute_auto_injected_files(self) -> List[Dict[str, Any]]:
+    def load_injected_file(self, file_path: Path, base_context: Path = None, check_duplicates: bool = False) -> List[Dict[str, Any]]:
+        """Load injected files from a text file with # comments and ./ convention.
+        
+        Args:
+            file_path: Path to the injected text file
+            base_context: Base context for resolving ./ paths (defaults to current_context)
+            check_duplicates: If True, checks against existing injected_files to avoid duplicates
+        
+        Returns:
+            List of injection records with 'file' and 'injected_at' keys
+        """
+        if not file_path.exists():
+            return []
+        
+        if base_context is None:
+            base_context = self.current_context
+            
+        injected_files = []
+        seen = set()
+        
+        if check_duplicates:
+            seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
+        
+        try:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    # Handle different path conventions
+                    if line.startswith('./'):
+                        # Context-relative: ./main.py
+                        full_path = base_context / line[2:]
+                        stored_path = str(full_path.relative_to(self.lab_root))
+                    elif line.startswith('/'):
+                        # Absolute path: /Users/val/lab/ideas/cli/main.py
+                        abs_path = Path(line)
+                        if abs_path.exists():
+                            try:
+                                stored_path = str(abs_path.relative_to(self.lab_root))
+                            except ValueError:
+                                # Absolute path is outside lab_root, reject it
+                                print(f"Warning: Absolute path {line} is outside lab_root, skipping")
+                                continue
+                        else:
+                            continue  # Absolute path doesn't exist
+                    else:
+                        # Lab-root relative: ideas/cli/main.py
+                        stored_path = line
+                    
+                    # Check file existence and duplicates
+                    if (self.lab_root / stored_path).exists():
+                        if not check_duplicates or stored_path not in seen:
+                            injected_files.append({
+                                'file': stored_path,
+                                'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                            })
+                            seen.add(stored_path)
+        except Exception:
+            print(f"Warning: Failed to load injected file from {file_path}")
+        
+        return injected_files
+
+    def get_injected_files(self) -> List[Dict[str, Any]]:
+        """Get all injected files by reading from disk (no caching)."""
         injected_files: List[Dict[str, Any]] = []
 
+        # Auto-inject Makefile
         if self.config.get('auto_inject_makefile', True):
             makefile_path = self.current_context / 'Makefile'
             if makefile_path.exists():
@@ -476,99 +538,46 @@ class ChatCLI:
                     'injected_at': datetime.datetime.now().isoformat() + 'Z'
                 })
 
-        injected_yaml_path = self.current_context / 'injected.yaml'
-        if injected_yaml_path.exists():
-            try:
-                with open(injected_yaml_path, 'r') as f:
-                    injected_config = pyyaml.safe_load(f)
-            except Exception:
-                print(f"Warning: Failed to load injected.yaml from {injected_yaml_path}")
-                injected_config = None
-
-            if isinstance(injected_config, list):
-                for item in injected_config:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get('auto', True):
-                        file_str = item.get('file')
-                        if not isinstance(file_str, str):
-                            continue
-                        file_path = self.lab_root / file_str
-                        if file_path.exists():
-                            injected_files.append({
-                                'file': file_str,
-                                'injected_at': datetime.datetime.now().isoformat() + 'Z'
-                            })
-
+        # Auto-injected files from injected.txt
+        injected_txt_path = self.current_context / 'injected.txt'
+        injected_files.extend(self.load_injected_file(injected_txt_path))
+        
+        # Manual injections from local.injected.txt
+        local_injected_path = self.current_context / 'convos' / 'local.injected.txt'
+        manual_injections = self.load_injected_file(local_injected_path, check_duplicates=False)
+        injected_files.extend(manual_injections)
+        
         return injected_files
 
-    def refresh_injected_files(self, *, notify: bool, record_meta: bool):
-        prev_set = self.last_injected_set or {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-
-        injected_files = self.compute_auto_injected_files()
-
-        manual = None
-        if isinstance(getattr(self, 'current_context_state', None), dict):
-            manual = self.current_context_state.get('manual_inject')
-
-        if isinstance(manual, list):
-            seen = {inj.get('file') for inj in injected_files if isinstance(inj, dict)}
-            for file_path in manual:
-                if not isinstance(file_path, str):
-                    continue
-                if file_path in seen:
-                    continue
-                injected_files.append({
-                    'file': file_path,
-                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
-                })
-                seen.add(file_path)
-
-        new_set = {inj.get('file') for inj in injected_files if isinstance(inj, dict)}
-        added = sorted([p for p in (new_set - prev_set) if isinstance(p, str)])
-        removed = sorted([p for p in (prev_set - new_set) if isinstance(p, str)])
-
-        self.injected_files = injected_files
-        self.last_injected_set = new_set
-
-        if not added and not removed:
-            return
-
-        if notify:
-            msg_parts = []
-            if added:
-                msg_parts.append(f"+{len(added)}")
-            if removed:
-                msg_parts.append(f"-{len(removed)}")
-            summary = ' '.join(msg_parts) if msg_parts else '0'
-            detail = []
-            if added:
-                detail.append('+' + ', +'.join(added))
-            if removed:
-                detail.append('-' + ', -'.join(removed))
-            detail_str = (' ' + ' '.join(detail)) if detail else ''
-            print(f"Injected set changed ({summary}){detail_str}")
-
-        if record_meta and self.current_convo:
-            event_meta: Dict[str, Any] = {
-                'timestamp': datetime.datetime.now().isoformat() + 'Z',
-                'event': 'injected_set_changed',
-                'context': str(self.current_context.relative_to(self.lab_root)),
-                'added': added,
-                'removed': removed,
-            }
-            try:
-                injected_yaml_path = self.current_context / 'injected.yaml'
-                if injected_yaml_path.exists():
-                    event_meta['injected_yaml_mtime'] = injected_yaml_path.stat().st_mtime
-            except Exception:
-                print(f"Warning: Failed to get mtime for {injected_yaml_path}")
-                pass
-            self.write_convo_meta(self.current_convo, event_meta)
-
-    def write_convo_meta(self, convo_id: str, meta: Dict[str, Any]):
-        convo_dir = self.get_convo_path(convo_id)
-        self.write_convo_file(convo_dir, meta, 'meta')
+    def save_injected_file(self, file_path: Path, injections: List[str], header: str = None, mode: str = 'write') -> bool:
+        """Save injections to a text file with proper formatting.
+        
+        Args:
+            file_path: Path to the injected text file
+            injections: List of file paths to inject
+            header: Optional header comment to include
+            mode: 'write' to overwrite, 'append' to append
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            if mode == 'append':
+                with open(file_path, 'a') as f:
+                    for injection in injections:
+                        f.write(f"{injection}\n")
+            else:  # write mode
+                with open(file_path, 'w') as f:
+                    if header:
+                        f.write(f"{header}\n")
+                    for injection in injections:
+                        f.write(f"{injection}\n")
+            return True
+        except Exception:
+            print(f"Warning: Failed to save injected file to {file_path}")
+            return False
 
     def write_meta_update(self):
         if not self.current_convo:
@@ -601,7 +610,7 @@ class ChatCLI:
         self.set_context_convo(convo_id)
         if not self.first_convo:
             self.first_convo = convo_id
-        self.save_state()
+        self.save_user_state()
         return convo_id
     
     def create_convo_symlink(self, convo_id: str, name: str):
@@ -654,10 +663,6 @@ class ChatCLI:
         
         raise ValueError(f"Invalid prompt format in {prompt_name}")
     
-    def inject_files(self):
-        """Inject configured files into context."""
-        self.injected_files.extend(self.compute_auto_injected_files())
-    
     def build_context(self) -> str:
         """Build the full context for the AI."""
         context_parts = []
@@ -669,7 +674,7 @@ class ChatCLI:
             context_parts.append("")
         
         # Add injected files
-        for injected in self.injected_files:
+        for injected in self.get_injected_files():
             context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
             full_path = self.lab_root / injected['file']
             try:
@@ -714,8 +719,6 @@ class ChatCLI:
         """Send a message to the AI and get response."""
         if not self.current_convo:
             self.create_convo()
-
-        self.refresh_injected_files(notify=True, record_meta=True)
         
         convo_dir = self.get_convo_path(self.current_convo)
 
@@ -866,7 +869,7 @@ class ChatCLI:
                 target = symlink_path.readlink()
                 convo_id = target.name
                 self.set_context_convo(convo_id)
-                self.save_state()
+                self.save_user_state()
                 print(f"Switched to conversation: {convo_name}")
             else:
                 print(f"Conversation '{convo_name}' not found")
@@ -915,9 +918,10 @@ class ChatCLI:
         else:
             print("  Active Prompts: None")
         
-        if self.injected_files:
-            print(f"  Injected Files: {len(self.injected_files)}")
-            for injected in self.injected_files:
+        injected_files = self.get_injected_files()
+        if injected_files:
+            print(f"  Injected Files: {len(injected_files)}")
+            for injected in injected_files:
                 print(f"    - {injected['file']}")
         else:
             print("  Injected Files: None")
@@ -950,12 +954,8 @@ class ChatCLI:
         new_context = self.lab_root / args[0]
         if new_context.exists() and new_context.is_dir():
             self.current_context = new_context
-            self.injected_files = []
             self.load_context_state()
-            self.inject_files()
-            self.apply_manual_injections_from_context_state()
-            self.last_injected_set = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-            self.save_state()
+            self.save_user_state()
 
             new_convo = self.current_convo
             new_context_rel = str(self.current_context.resolve())
@@ -973,7 +973,8 @@ class ChatCLI:
                     'to_context': new_context_rel,
                     'to_convo': new_convo,
                 }
-                self.write_convo_meta(old_convo, leave_meta)
+                old_convo_dir = self.get_convo_path(old_convo)
+                self.write_convo_file(old_convo_dir, leave_meta, 'meta')
             print(f"Switched to context: {new_context.relative_to(self.lab_root)}")
         else:
             print(f"Context '{args[0]}' not found")
@@ -1020,57 +1021,79 @@ class ChatCLI:
             print("Unknown prompt command. Use: add, drop")
     
     def handle_inject(self, args: List[str]):
-        """Handle file injection."""
+        """Handle file injection using local.injected.txt."""
+        local_injected_path = self.current_context / 'convos' / 'local.injected.txt'
+        
         if not args:
             print("Currently injected files:")
-            for injected in self.injected_files:
+            for injected in self.get_injected_files():
                 print(f"  {injected['file']}")
             return
         
         if args[0] == 'list':
             self.handle_inject([])
         elif args[0] == 'clear':
-            self.injected_files = []
-            self.inject_files()
-            if not isinstance(getattr(self, 'current_context_state', None), dict):
-                self.current_context_state = {}
-            self.current_context_state['manual_inject'] = []
-            self.save_context_state()
-            self.write_meta_update()
-            print("Cleared injected files")
+            # Clear the local.injected.txt file using shared save function
+            header = "# Local injected files for this context\n# Add files to inject, comment out with # to disable\n"
+            if self.save_injected_file(local_injected_path, [], header=header, mode='write'):
+                self.write_meta_update()
+                print("Cleared injected files")
+            else:
+                print(f"Warning: Failed to clear {local_injected_path}")
         elif args[0] == 'drop':
             if len(args) < 2:
                 print("Usage: /inject drop <file>")
                 return
             file_path = args[1]
-            self.injected_files = [f for f in self.injected_files if f['file'] != file_path]
-            if isinstance(getattr(self, 'current_context_state', None), dict):
-                manual = self.current_context_state.get('manual_inject')
-                if isinstance(manual, list):
-                    self.current_context_state['manual_inject'] = [p for p in manual if p != file_path]
-                    self.save_context_state()
-            self.write_meta_update()
-            print(f"Dropped injected file: {file_path}")
+            
+            # Remove from local.injected.txt using shared save function
+            try:
+                # Read existing lines and filter out the target file
+                existing_injections = self.load_injected_file(local_injected_path, base_context=self.current_context, check_duplicates=False)
+                filtered_injections = [inj['file'] for inj in existing_injections if inj['file'] != file_path]
+                
+                # Also read raw lines to preserve comments and formatting
+                raw_lines = []
+                if local_injected_path.exists():
+                    with open(local_injected_path, 'r') as f:
+                        raw_lines = f.readlines()
+                
+                # Filter raw lines, preserving comments
+                filtered_lines = []
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if stripped != file_path and not stripped.startswith('# ' + file_path):
+                        filtered_lines.append(line)
+                
+                # Write back the filtered content
+                with open(local_injected_path, 'w') as f:
+                    f.writelines(filtered_lines)
+                
+                self.write_meta_update()
+                print(f"Dropped injected file: {file_path}")
+            except Exception:
+                print(f"Warning: Failed to drop {file_path} from {local_injected_path}")
         else:
             # Inject specific file
             file_path = args[0]
-            full_path = self.lab_root / file_path
+            
+            # Support both lab-root-relative and current-context-relative paths
+            if file_path.startswith('./'):
+                # Current context relative (./main.py)
+                full_path = self.current_context / file_path[2:]
+                stored_path = str(full_path.relative_to(self.lab_root))
+            else:
+                # Lab root relative (ideas/cli/main.py) - current behavior
+                full_path = self.lab_root / file_path
+                stored_path = file_path
+                
             if full_path.exists():
-                self.injected_files.append({
-                    'file': file_path,
-                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
-                })
-                if not isinstance(getattr(self, 'current_context_state', None), dict):
-                    self.current_context_state = {}
-                manual = self.current_context_state.get('manual_inject')
-                if not isinstance(manual, list):
-                    manual = []
-                if file_path not in manual:
-                    manual.append(file_path)
-                self.current_context_state['manual_inject'] = manual
-                self.save_context_state()
-                self.write_meta_update()
-                print(f"Injected file: {file_path}")
+                # Append to local.injected.txt using shared save function
+                if self.save_injected_file(local_injected_path, [file_path], mode='append'):
+                    self.write_meta_update()
+                    print(f"Injected file: {stored_path}")
+                else:
+                    print(f"Warning: Failed to add {stored_path} to {local_injected_path}")
             else:
                 print(f"File '{file_path}' not found")
     
