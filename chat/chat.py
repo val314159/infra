@@ -1308,57 +1308,78 @@ class ChatCLI:
             return {"error": f"Unknown tool: {function_name}", "success": False}
     
     def handle_tool_calls(self, response, messages, convo_dir) -> str:
-        """Handle tool calls and continue conversation."""
-        tool_results = []
+        """Handle tool calls and continue conversation with multi-turn support."""
+        max_iterations = 10  # Prevent infinite loops
+        iteration = 0
         
-        # Execute each tool call
-        for tool_call in response.choices[0].message.tool_calls:
-            result = self.execute_tool_call(tool_call)
-            print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
-            tool_results.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": tool_call.function.name,
-                "content": json.dumps(result)
-            })
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"DEBUG: Tool call iteration {iteration}")
+            
+            tool_results = []
+            
+            # Execute each tool call in this round
+            if response.choices[0].message.tool_calls:
+                print(f"DEBUG: Processing {len(response.choices[0].message.tool_calls)} tool calls")
+                
+                for tool_call in response.choices[0].message.tool_calls:
+                    result = self.execute_tool_call(tool_call)
+                    print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "content": json.dumps(result)
+                    })
+                
+                print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
+                
+                # Add AI's tool call request to messages
+                messages.append(response.choices[0].message)
+                
+                # Add tool results to messages
+                messages.extend(tool_results)
+                
+                # Get next AI response
+                try:
+                    print(f"DEBUG: Sending tool results to AI for next response")
+                    response = self.client.chat.completions.create(
+                        model=self.current_model,
+                        messages=messages,
+                        tools=self.get_available_tools(),  # Keep tools available for more calls
+                        tool_choice="auto",
+                        temperature=0.7
+                    )
+                    
+                    # Check if AI wants to make more tool calls
+                    if response.choices[0].message.tool_calls:
+                        print(f"DEBUG: AI wants to make more tool calls: {len(response.choices[0].message.tool_calls)}")
+                        continue  # Continue the loop for more tool calls
+                    else:
+                        print(f"DEBUG: AI is done with tool calls, providing final response")
+                        ai_response = response.choices[0].message.content
+                        break  # Exit the loop
+                        
+                except Exception as e:
+                    print(f"DEBUG: Error getting AI response: {e}")
+                    ai_response = f"Error after tool execution: {str(e)}"
+                    break
+            else:
+                # No tool calls in this response
+                ai_response = response.choices[0].message.content
+                break
         
-        print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
-        for i, tr in enumerate(tool_results):
-            print(f"DEBUG: Tool result {i}: {tr['name']} -> {tr['content'][:100]}...")
+        if iteration >= max_iterations:
+            ai_response = "Error: Too many tool call iterations, possible infinite loop"
         
-        # Add AI's tool call request to messages
-        messages.append(response.choices[0].message)
+        print(f"DEBUG: Final AI response after {iteration} iterations: {ai_response[:200]}...")
         
-        # Add tool results to messages
-        messages.extend(tool_results)
-        
-        # Get final AI response
-        try:
-            print(f"DEBUG: Sending tool results to AI for final response")
-            final_response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                temperature=0.7
-            )
-            ai_response = final_response.choices[0].message.content
-            print(f"DEBUG: Final AI response: {ai_response[:200]}...")
-        except Exception as e:
-            print(f"DEBUG: Error getting final AI response: {e}")
-            ai_response = f"Error after tool execution: {str(e)}"
-        
-        # Write tool interaction to conversation
+        # Write final tool interaction to conversation
         tool_msg = [{
             'role': 'asst',
             'content': ai_response,
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
-            'tool_calls': [
-                {
-                    'name': tc.function.name,
-                    'arguments': tc.function.arguments,
-                    'result': json.loads(tr['content'])
-                }
-                for tc, tr in zip(response.choices[0].message.tool_calls, tool_results)
-            ]
+            'iterations': iteration,
         }]
         self.write_convo_file(convo_dir, tool_msg, 'asst')
         
