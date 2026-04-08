@@ -147,6 +147,7 @@ class ChatCLI:
         self.current_model = self.config['default_model']
         self.current_endpoint = self.config['default_endpoint']
         self.retry_message: Optional[str] = ''
+        self.tool_processing = False  # Track when processing tools
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
 
@@ -1212,7 +1213,7 @@ class ChatCLI:
         
         while True:
             try:
-                # Show status
+                # Show status right before asking for input
                 status = self.get_status_line()
                 print(f"\n{status}")
                 
@@ -1267,24 +1268,22 @@ class ChatCLI:
         # Import tools module to get __index__
         try:
             from . import tools
-            print(f"DEBUG: tools module imported successfully")
-            print(f"DEBUG: __index__ has {len(tools.__index__)} tools: {list(tools.__index__.keys())}")
+            #print(f"DEBUG: tools module imported successfully")
+            #print(f"DEBUG: __index__ has {len(tools.__index__)} tools: {list(tools.__index__.keys())}")
             
             # Loop through __index__ to find tool signatures
             for tool_name, func in tools.__index__.items():
-                print(f"DEBUG: Checking tool: {tool_name} in function: {func}")
-                print("A")
+                #print(f"DEBUG: Checking tool: {tool_name} in function: {func}")
                 if hasattr(func, 'tool_signature'):
                     tool_signature = getattr(func, 'tool_signature')
-                    print(f"DEBUG: Found tool signature for {tool_name}: {tool_signature.get('function', {}).get('name', 'unknown')}")
+                    #print(f"DEBUG: Found tool signature for {tool_name}: {tool_signature.get('function', {}).get('name', 'unknown')}")
                     tool_list.append(tool_signature)
                 else:
-                    print(f"DEBUG: No tool_signature found for {tool_name}")
-                print("B")                    
+                    print(f"DEBUG: No tool_signature found for {tool_name}")                 
         except ImportError as e:
             print(f"DEBUG: Failed to import tools module: {e}")
         
-        print(f"DEBUG: Total tools loaded: {len(tool_list)}")
+        #print(f"DEBUG: Total tools loaded: {len(tool_list)}")
         return tool_list
     
     def execute_tool_call(self, tool_call) -> Dict[str, Any]:

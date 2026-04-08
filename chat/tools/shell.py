@@ -3,7 +3,7 @@ import subprocess as _subp
 def shell(cmd):
     """Execute shell command in Docker container and return structured result for tool calling."""    
     try:
-        print("SHELL:", cmd)
+        #print("SHELL:", cmd)
         result = _subp.run(
             ["docker", "exec", "-it", "sandbox", "sh", "-c", cmd],  # Use sh instead of bash
             capture_output=True, 
