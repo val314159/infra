@@ -87,6 +87,7 @@ from docopt import docopt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
+from .tools import __index__ as tool_index
 
 class ChatCLI:
     # Unix permission constants (core architectural choices)
@@ -149,6 +150,9 @@ class ChatCLI:
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
 
+        # Initialize context state before loading
+        self.current_context_state = {}
+
         self.load_user_state()
         self.load_context_state()
         
@@ -178,7 +182,7 @@ class ChatCLI:
                 candidate = Path.cwd() / ctx
 
             if candidate.exists() and candidate.is_dir():
-                self.current_context = candidate
+                self.set_current_context(candidate)  # Use centralized method to chdir
 
         fc = state.get('first_convo')
         if isinstance(fc, str) and fc:
@@ -191,6 +195,18 @@ class ChatCLI:
             'saved_at': datetime.datetime.now().isoformat() + 'Z',
         }
         self.save_json_file(self.state_file, state)
+
+    def set_current_context(self, new_context: Path):
+        """Set current context and change working directory."""
+        old_context = self.current_context
+        self.current_context = new_context
+        os.chdir(new_context)  # Single place for chdir
+        
+        # Save the change
+        self.save_context_state()
+        self.save_user_state()
+        
+        return old_context
 
     def load_context_state(self):
         context_state_file = self.get_context_state_file()
@@ -218,10 +234,19 @@ class ChatCLI:
                     break
 
         self.current_convo = selected
+        
+        # If we have a saved context directory, change to it
+        saved_context = state.get('context_directory')
+        if saved_context and Path(saved_context).exists():
+            self.set_current_context(Path(saved_context))
 
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
         context_state_file = self.get_context_state_file()
+        
+        # Save current context directory for restoration
+        self.current_context_state['context_directory'] = str(self.current_context)
+        
         self.save_json_file(context_state_file, self.current_context_state)
 
     def set_context_convo(self, convo_id: Optional[str]):
@@ -737,14 +762,32 @@ class ChatCLI:
         if not retry_this_turn:
             messages.append({'role': 'user', 'content': message})
         
-        # Get AI response
+        # Get AI response with tool calling
         try:
+            # Get available tools
+            tools = self.get_available_tools()
+            print(f"DEBUG: Sending {len(tools)} tools to AI:")
+            for i, tool in enumerate(tools):
+                print(f"DEBUG: Tool {i}: {tool.get('function', {}).get('name', 'unknown')}")
+            
             response = self.client.chat.completions.create(
                 model=self.current_model,
                 messages=messages,
+                tools=tools,
+                tool_choice="auto" if tools else None,
                 temperature=0.7
             )
-            ai_response = response.choices[0].message.content
+            
+            # Handle tool calls
+            if response.choices[0].message.tool_calls:
+                print(f"DEBUG: AI made {len(response.choices[0].message.tool_calls)} tool calls:")
+                for i, tool_call in enumerate(response.choices[0].message.tool_calls):
+                    print(f"DEBUG: Tool call {i}: {tool_call.function.name} with args: {tool_call.function.arguments}")
+                ai_response = self.handle_tool_calls(response, messages, convo_dir)
+            else:
+                print("DEBUG: AI did not make any tool calls")
+                ai_response = response.choices[0].message.content
+                
         except Exception as e:
             ai_response = f"Error: {str(e)}"
         
@@ -900,9 +943,9 @@ class ChatCLI:
 
         new_context = Path.cwd() / args[0]
         if new_context.exists() and new_context.is_dir():
-            self.current_context = new_context
-            self.load_context_state()
-            self.save_user_state()
+            old_context = self.set_current_context(new_context)  # Centralized chdir
+            
+            self.load_context_state()  # Load context after changing directory
 
             new_convo = self.current_convo
             new_context_rel = str(self.current_context)
@@ -911,7 +954,7 @@ class ChatCLI:
                 leave_meta: Dict[str, Any] = {
                     'timestamp': datetime.datetime.now().isoformat() + 'Z',
                     'event': 'switch_context',
-                    'from_context': old_context_rel,
+                    'from_context': str(old_context),
                     'to_context': new_context_rel,
                     'to_convo': new_convo,
                 }
@@ -1189,7 +1232,6 @@ class ChatCLI:
                         proc = subprocess.run(
                             cmd,
                             shell=True,
-                            cwd=str(self.current_context),
                             text=True,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
@@ -1217,6 +1259,92 @@ class ChatCLI:
                 break
             except Exception as e:
                 print(f"Error: {e}")
+
+    def get_available_tools(self) -> List[Dict]:
+        """Get available tools from tool index."""
+        tools = []
+        
+        # Import shell module to get tool signature
+        try:
+            from .tools import shell as shell_module
+            print(f"DEBUG: shell module imported successfully")
+            if hasattr(shell_module, 'shell') and hasattr(shell_module.shell, 'tool_signature'):
+                print(f"DEBUG: shell.tool_signature found: {shell_module.shell.tool_signature}")
+                tools.append(shell_module.shell.tool_signature)
+            else:
+                print(f"DEBUG: shell.tool_signature not found")
+                print(f"DEBUG: shell function exists: {hasattr(shell_module, 'shell')}")
+                if hasattr(shell_module, 'shell'):
+                    print(f"DEBUG: shell function attributes: {dir(shell_module.shell)}")
+        except ImportError as e:
+            print(f"DEBUG: Failed to import shell module: {e}")
+        
+        print(f"DEBUG: Total tools loaded: {len(tools)}")
+        return tools
+    
+    def execute_tool_call(self, tool_call) -> Dict[str, Any]:
+        """Execute a tool call using the tool index."""
+        function_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+        
+        # Look up function in tool_index
+        if function_name in tool_index:
+            try:
+                result = tool_index[function_name](**arguments)
+                return {"result": result, "success": True}
+            except Exception as e:
+                return {"error": str(e), "success": False}
+        else:
+            return {"error": f"Unknown tool: {function_name}", "success": False}
+    
+    def handle_tool_calls(self, response, messages, convo_dir) -> str:
+        """Handle tool calls and continue conversation."""
+        tool_results = []
+        
+        # Execute each tool call
+        for tool_call in response.choices[0].message.tool_calls:
+            result = self.execute_tool_call(tool_call)
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_call.function.name,
+                "content": json.dumps(result)
+            })
+        
+        # Add AI's tool call request to messages
+        messages.append(response.choices[0].message)
+        
+        # Add tool results to messages
+        messages.extend(tool_results)
+        
+        # Get final AI response
+        try:
+            final_response = self.client.chat.completions.create(
+                model=self.current_model,
+                messages=messages,
+                temperature=0.7
+            )
+            ai_response = final_response.choices[0].message.content
+        except Exception as e:
+            ai_response = f"Error after tool execution: {str(e)}"
+        
+        # Write tool interaction to conversation
+        tool_msg = [{
+            'role': 'asst',
+            'content': ai_response,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z',
+            'tool_calls': [
+                {
+                    'name': tc.function.name,
+                    'arguments': tc.function.arguments,
+                    'result': json.loads(tr['content'])
+                }
+                for tc, tr in zip(response.choices[0].message.tool_calls, tool_results)
+            ]
+        }]
+        self.write_convo_file(convo_dir, tool_msg, 'asst')
+        
+        return ai_response
 
 def main():
     """Main entry point for the CLI."""
