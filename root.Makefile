@@ -1,5 +1,5 @@
 
-infra::	
+infra::
 	uv run --env-file $@/.env --project $@ $@
 
 clean::
