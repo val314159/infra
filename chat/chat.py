@@ -1292,14 +1292,19 @@ class ChatCLI:
         function_name = tool_call.function.name
         arguments = json.loads(tool_call.function.arguments)
         
+        print(f"DEBUG: Executing tool: {function_name} with args: {arguments}")
+        
         # Look up function in tool_index
         if function_name in tool_index:
             try:
                 result = tool_index[function_name](**arguments)
+                print(f"DEBUG: Tool execution result: {result}")
                 return {"result": result, "success": True}
             except Exception as e:
+                print(f"DEBUG: Tool execution error: {e}")
                 return {"error": str(e), "success": False}
         else:
+            print(f"DEBUG: Tool not found in index: {function_name}")
             return {"error": f"Unknown tool: {function_name}", "success": False}
     
     def handle_tool_calls(self, response, messages, convo_dir) -> str:
@@ -1309,12 +1314,17 @@ class ChatCLI:
         # Execute each tool call
         for tool_call in response.choices[0].message.tool_calls:
             result = self.execute_tool_call(tool_call)
+            print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
             tool_results.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "name": tool_call.function.name,
                 "content": json.dumps(result)
             })
+        
+        print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
+        for i, tr in enumerate(tool_results):
+            print(f"DEBUG: Tool result {i}: {tr['name']} -> {tr['content'][:100]}...")
         
         # Add AI's tool call request to messages
         messages.append(response.choices[0].message)
@@ -1324,13 +1334,16 @@ class ChatCLI:
         
         # Get final AI response
         try:
+            print(f"DEBUG: Sending tool results to AI for final response")
             final_response = self.client.chat.completions.create(
                 model=self.current_model,
                 messages=messages,
                 temperature=0.7
             )
             ai_response = final_response.choices[0].message.content
+            print(f"DEBUG: Final AI response: {ai_response[:200]}...")
         except Exception as e:
+            print(f"DEBUG: Error getting final AI response: {e}")
             ai_response = f"Error after tool execution: {str(e)}"
         
         # Write tool interaction to conversation
