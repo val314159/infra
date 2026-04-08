@@ -1262,25 +1262,30 @@ class ChatCLI:
 
     def get_available_tools(self) -> List[Dict]:
         """Get available tools from tool index."""
-        tools = []
+        tool_list = []
         
-        # Import shell module to get tool signature
+        # Import tools module to get __index__
         try:
-            from .tools import shell as shell_module
-            print(f"DEBUG: shell module imported successfully")
-            if hasattr(shell_module, 'shell') and hasattr(shell_module.shell, 'tool_signature'):
-                print(f"DEBUG: shell.tool_signature found: {shell_module.shell.tool_signature}")
-                tools.append(shell_module.shell.tool_signature)
-            else:
-                print(f"DEBUG: shell.tool_signature not found")
-                print(f"DEBUG: shell function exists: {hasattr(shell_module, 'shell')}")
-                if hasattr(shell_module, 'shell'):
-                    print(f"DEBUG: shell function attributes: {dir(shell_module.shell)}")
+            from . import tools
+            print(f"DEBUG: tools module imported successfully")
+            print(f"DEBUG: __index__ has {len(tools.__index__)} tools: {list(tools.__index__.keys())}")
+            
+            # Loop through __index__ to find tool signatures
+            for tool_name, func in tools.__index__.items():
+                print(f"DEBUG: Checking tool: {tool_name} in function: {func}")
+                print("A")
+                if hasattr(func, 'tool_signature'):
+                    tool_signature = getattr(func, 'tool_signature')
+                    print(f"DEBUG: Found tool signature for {tool_name}: {tool_signature.get('function', {}).get('name', 'unknown')}")
+                    tool_list.append(tool_signature)
+                else:
+                    print(f"DEBUG: No tool_signature found for {tool_name}")
+                print("B")                    
         except ImportError as e:
-            print(f"DEBUG: Failed to import shell module: {e}")
+            print(f"DEBUG: Failed to import tools module: {e}")
         
-        print(f"DEBUG: Total tools loaded: {len(tools)}")
-        return tools
+        print(f"DEBUG: Total tools loaded: {len(tool_list)}")
+        return tool_list
     
     def execute_tool_call(self, tool_call) -> Dict[str, Any]:
         """Execute a tool call using the tool index."""
