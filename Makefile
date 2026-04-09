@@ -3,7 +3,7 @@
 UV=UV_ENV_FILE=.env uv
 
 cli:
-	${UV} run -m chat
+	${UV} run tools/chat/chat.py
 
 clean:
 	find . -name \*~ -o -name .\*~ | xargs rm -fr

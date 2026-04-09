@@ -1,6 +1,6 @@
 
 infra::	
-	uv run --env-file $@/.env --project $@ $@
+	uv run --env-file $@/.env --project $@ -m $@
 
 clean::
 	find . -name \*~ -o -name .\*~ | xargs rm -fr
