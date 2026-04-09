@@ -31,7 +31,7 @@ __version__ = '0.1.0'
 HELP_MESSAGE = '''Lab Infra Chat CLI Commands
 
 Conversation:
-  /convo [name|uuid]       Change or list conversations
+  /convo [name]            Change or list conversations
   /convo new [name]        Start new conversation
   /convo list              List conversations in current context
 
@@ -60,7 +60,7 @@ Info:
   /show history           Show conversation history
   /status                 Alias for /show status
   /history                Alias for /show history
-  !<cmd>                  Run a shell command in the current context
+  !<cmd>                Run a shell command in the current context
   /help                   Show this help
   /quit                   Exit the chat
   /exit                   Alias for /quit
@@ -77,11 +77,10 @@ import sys
 import uuid
 import yaml as pyyaml
 import json
-import glob
 import subprocess
 import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import openai
 from docopt import docopt
 from prompt_toolkit import PromptSession
@@ -120,6 +119,15 @@ class ChatCLI:
             print(f"Warning: Failed to save {file_path}")
             return False
 
+    def deep_update(self, base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge dictionaries without dropping nested defaults."""
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                self.deep_update(base[key], value)
+            else:
+                base[key] = value
+        return base
+
     @property
     def lab_home(self) -> Path:
         return Path.home() / '.lab'
@@ -145,9 +153,6 @@ class ChatCLI:
         self.current_prompts = []
         self.current_model = self.config['default_model']
         self.current_endpoint = self.config['default_endpoint']
-        self.retry_message: Optional[str] = ''
-
-        self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
 
         self.load_user_state()
         self.load_context_state()
@@ -159,12 +164,8 @@ class ChatCLI:
         self.setup_history()
         self.setup_completion()
 
-        # Setup OpenAI client
-        endpoint_config = self.config['endpoints'][self.current_endpoint]        
-        if (api_key := endpoint_config['key_env']).isupper():
-            if not (api_key := os.getenv(api_key)):
-                raise ValueError(f"Missing {api_key} environment variable")
-        self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
+        # Setup LLM client
+        self.setup_llm()
         
     def load_user_state(self):
         state = self.load_json_file(self.state_file)
@@ -218,6 +219,7 @@ class ChatCLI:
                     break
 
         self.current_convo = selected
+        self.restore_convo_state()
 
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
@@ -226,6 +228,7 @@ class ChatCLI:
 
     def set_context_convo(self, convo_id: Optional[str]):
         self.current_convo = convo_id
+        self.restore_convo_state()
 
         if not isinstance(getattr(self, 'current_context_state', None), dict):
             self.current_context_state = {}
@@ -250,8 +253,7 @@ class ChatCLI:
                     'key_env': 'dummy'
                 }
             },
-            'auto_inject_makefile': True,   
-            'restore_last_convo': True
+            'auto_inject_makefile': True,
         }
 
         # Load user config from ~/.lab/config.yaml
@@ -260,7 +262,8 @@ class ChatCLI:
             try:
                 with open(user_config_path, 'r') as f:
                     loaded_config = pyyaml.safe_load(f)
-                default_config.update(loaded_config)
+                if isinstance(loaded_config, dict):
+                    self.deep_update(default_config, loaded_config)
             except Exception:
                 print(f"Warning: Failed to load config from {user_config_path}")
         else:
@@ -278,11 +281,22 @@ class ChatCLI:
             try:
                 with open(config_path, 'r') as f:
                     loaded_config = pyyaml.safe_load(f)
-                default_config.update(loaded_config)
+                if isinstance(loaded_config, dict):
+                    self.deep_update(default_config, loaded_config)
             except Exception:
                 print(f"Warning: Failed to load config from {config_path}")
         
         return default_config
+
+    def setup_llm(self):
+        endpoint_config = self.config['endpoints'][self.current_endpoint]
+        api_key = endpoint_config['key_env']
+        if api_key.isupper():
+            env_value = os.getenv(api_key)
+            if not env_value:
+                raise ValueError(f"Missing {api_key} environment variable")
+            api_key = env_value
+        self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
     
     def setup_completion(self):
         """Setup prompt-toolkit tab completion."""
@@ -443,7 +457,12 @@ class ChatCLI:
         # Add injected files
         for injected in self.get_injected_files():
             context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
-            full_path = Path(injected['file'])
+            _, full_path = self.normalize_injected_path(injected['file'])
+            if full_path is None:
+                context_parts.append("Error reading injected file: file no longer exists")
+                context_parts.append("</injected>")
+                context_parts.append("")
+                continue
             try:
                 with open(full_path, 'r') as f:
                     context_parts.append(f.read())
@@ -480,13 +499,63 @@ class ChatCLI:
         meta = self.build_meta_state(convo_id=self.current_convo)
         self.write_convo_file(convo_dir, meta, 'meta')
 
-    def load_injected_file(self, file_path: Path, base_context: Path = None, check_duplicates: bool = False) -> List[Dict[str, Any]]:
+    def restore_convo_state(self):
+        """Restore model and prompts from the active conversation's latest metadata."""
+        self.current_prompts = []
+        self.current_model = self.config['default_model']
+        self.current_endpoint = self.config['default_endpoint']
+
+        if not self.current_convo:
+            self.setup_llm()
+            return
+
+        convo_dir = self.get_convo_path(self.current_convo)
+        latest_meta: Optional[Dict[str, Any]] = None
+
+        for filepath in sorted(convo_dir.glob('*-meta.yaml')):
+            try:
+                with open(filepath, 'r') as f:
+                    content = pyyaml.safe_load(f)
+            except Exception:
+                continue
+            if isinstance(content, dict):
+                latest_meta = content
+
+        if latest_meta:
+            model = latest_meta.get('model')
+            endpoint = latest_meta.get('endpoint')
+            prompts = latest_meta.get('prompts')
+
+            if isinstance(model, str) and model:
+                self.current_model = model
+            if isinstance(endpoint, str) and endpoint in self.config['endpoints']:
+                self.current_endpoint = endpoint
+            if isinstance(prompts, list):
+                restored_prompts = []
+                for prompt in prompts:
+                    if not isinstance(prompt, dict):
+                        continue
+                    name = prompt.get('prompt')
+                    version = prompt.get('version')
+                    snapshot = prompt.get('snapshot')
+                    if isinstance(name, str) and isinstance(version, str) and isinstance(snapshot, str):
+                        restored_prompts.append({
+                            'name': name,
+                            'version': version,
+                            'snapshot': snapshot,
+                            'frontmatter': None,
+                        })
+                self.current_prompts = restored_prompts
+
+        self.setup_llm()
+
+    def load_injected_file(self, file_path: Path, base_context: Path = None, seen: Optional[set[str]] = None) -> List[Dict[str, Any]]:
         """Load injected files from a text file with # comments and ./ convention.
         
         Args:
             file_path: Path to the injected text file
             base_context: Base context for resolving ./ paths (defaults to current_context)
-            check_duplicates: If True, checks against existing injected_files to avoid duplicates
+            seen: Optional set of resolved paths to deduplicate against
         
         Returns:
             List of injection records with 'file' and 'injected_at' keys
@@ -498,10 +567,7 @@ class ChatCLI:
             base_context = self.current_context
             
         injected_files = []
-        seen = set()
-        
-        if check_duplicates:
-            seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
+        seen = seen or set()
         
         try:
             with open(file_path, 'r') as f:
@@ -535,7 +601,7 @@ class ChatCLI:
                     
                     # Check file existence and duplicates
                     if Path(stored_path).exists():
-                        if not check_duplicates or stored_path not in seen:
+                        if stored_path not in seen:
                             injected_files.append({
                                 'file': stored_path,
                                 'injected_at': datetime.datetime.now().isoformat() + 'Z'
@@ -549,6 +615,7 @@ class ChatCLI:
     def get_injected_files(self) -> List[Dict[str, Any]]:
         """Get all injected files by reading from disk (no caching)."""
         injected_files: List[Dict[str, Any]] = []
+        seen: set[str] = set()
 
         # Auto-inject Makefile
         if self.config.get('auto_inject_makefile', True):
@@ -558,25 +625,25 @@ class ChatCLI:
                     'file': str(makefile_path),
                     'injected_at': datetime.datetime.now().isoformat() + 'Z'
                 })
+                seen.add(str(makefile_path))
 
         # Auto-injected files from injected.txt
         injected_txt_path = self.current_context / 'injected.txt'
-        injected_files.extend(self.load_injected_file(injected_txt_path))
+        injected_files.extend(self.load_injected_file(injected_txt_path, seen=seen))
         
         # Manual injections from local.injected.txt
         local_injected_path = self.current_context / 'convos' / 'local.injected.txt'
-        manual_injections = self.load_injected_file(local_injected_path, check_duplicates=False)
+        manual_injections = self.load_injected_file(local_injected_path, seen=seen)
         injected_files.extend(manual_injections)
         
         return injected_files
 
-    def save_injected_file(self, file_path: Path, injections: List[str], header: str = None, mode: str = 'write') -> bool:
-        """Save injections to a text file with proper formatting.
+    def save_injected_file(self, file_path: Path, injections: List[str], mode: str = 'write') -> bool:
+        """Save injections to a text file.
         
         Args:
             file_path: Path to the injected text file
             injections: List of file paths to inject
-            header: Optional header comment to include
             mode: 'write' to overwrite, 'append' to append
             
         Returns:
@@ -587,29 +654,68 @@ class ChatCLI:
             
             if mode == 'append':
                 with open(file_path, 'a') as f:
-                    if header and not file_path.exists():
-                        f.write(f"{header}\n")
                     for injection in injections:
                         f.write(f"{injection}\n")
             else:  # write mode
                 with open(file_path, 'w') as f:
-                    if header:
-                        f.write(f"{header}\n")
                     for injection in injections:
                         f.write(f"{injection}\n")
             return True
         except Exception:
             print(f"Warning: Failed to save injected file to {file_path}")
             return False
+
+    def normalize_injected_path(self, raw_path: str, base_context: Optional[Path] = None) -> Tuple[Optional[str], Optional[Path]]:
+        """Normalize an injected path for stable storage/display plus a resolved filesystem path."""
+        if base_context is None:
+            base_context = self.current_context
+
+        if raw_path.startswith('./'):
+            resolved_path = (base_context / raw_path[2:]).resolve()
+        elif raw_path.startswith('/'):
+            resolved_path = Path(raw_path).resolve()
+        else:
+            resolved_path = (Path.cwd() / raw_path).resolve()
+
+        if not resolved_path.exists():
+            return None, None
+
+        try:
+            relative = resolved_path.relative_to(base_context.resolve())
+            return f"./{relative}", resolved_path
+        except ValueError:
+            return str(resolved_path), resolved_path
     
+    def get_convo_symlink_path(self, name: str) -> Tuple[Path, str]:
+        safe_name = name.lower().replace(' ', '-').replace('/', '-')
+        return self.current_context / 'convos' / f"{safe_name}.yaml", safe_name
+
+    def validate_convo_name(self, name: str) -> bool:
+        symlink_path, safe_name = self.get_convo_symlink_path(name)
+        if not safe_name:
+            print("Conversation name is empty after sanitization")
+            return False
+
+        if symlink_path.exists() or symlink_path.is_symlink():
+            if not symlink_path.is_symlink():
+                print(f"Refusing to create conversation: {symlink_path} already exists and is not a symlink")
+                return False
+            print(f"Refusing to create conversation: {symlink_path} already exists")
+            return False
+
+        return True
+
     def create_convo(self, name: str = None) -> str:
         """Create a new conversation."""
+        if name is None:
+            name = f"convo-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        if not self.validate_convo_name(name):
+            raise ValueError(f"Cannot create conversation named '{name}'")
+
         convo_id = str(uuid.uuid4())
         convo_dir = self.get_convo_path(convo_id)
         convo_dir.mkdir(exist_ok=True)
-        
-        if name is None:
-            name = f"convo-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
         
         meta = self.build_meta_state(include_title=True, title=name, convo_id=convo_id)
         meta['fork_of'] = None
@@ -633,15 +739,9 @@ class ChatCLI:
         context_convos_dir = self.current_context / 'convos'
         context_convos_dir.mkdir(exist_ok=True)
         
-        # Sanitize name for filename
-        safe_name = name.lower().replace(' ', '-').replace('/', '-')
-        symlink_path = context_convos_dir / f"{safe_name}.yaml"
+        symlink_path, _ = self.get_convo_symlink_path(name)
         target_path = self.get_convo_path(convo_id)
-        
-        # Remove existing symlink if it exists
-        if symlink_path.exists():
-            symlink_path.unlink()
-        
+
         # Create relative symlink
         relative_target = os.path.relpath(target_path, context_convos_dir)
         symlink_path.symlink_to(relative_target)
@@ -678,45 +778,18 @@ class ChatCLI:
         
         raise ValueError(f"Invalid prompt format in {prompt_name}")
 
-    def get_pending_user_message(self) -> Optional[str]:
-        if not self.current_convo:
-            return None
-
-        history = self.load_convo_history()
-        if not history:
-            return None
-
-        last = history[-1]
-        if not isinstance(last, dict):
-            return None
-
-        if last.get('role') != 'user':
-            return None
-
-        content = last.get('content')
-        if not isinstance(content, str):
-            return None
-
-        return content
-    
     def send_message(self, message: str) -> str:
         """Send a message to the AI and get response."""
         if not self.current_convo:
             self.create_convo()
         
         convo_dir = self.get_convo_path(self.current_convo)
-
-        pending_message = self.retry_message
-        retry_this_turn = bool(pending_message is not None and pending_message == message)
-        self.retry_message = ''
-        
-        if not retry_this_turn:
-            user_msg = [{
-                'role': 'user',
-                'content': message,
-                'timestamp': datetime.datetime.now().isoformat() + 'Z'
-            }]
-            self.write_convo_file(convo_dir, user_msg, 'user')
+        user_msg = [{
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z'
+        }]
+        self.write_convo_file(convo_dir, user_msg, 'user')
         
         # Build full context
         full_context = self.build_context()
@@ -730,12 +803,11 @@ class ChatCLI:
         
         # Add history
         for msg in history:
-            if msg['role'] in ['user', 'assistant']:
-                messages.append({'role': msg['role'], 'content': msg['content']})
-        
-        # Add current message
-        if not retry_this_turn:
-            messages.append({'role': 'user', 'content': message})
+            role = msg.get('role')
+            if role == 'asst':
+                role = 'assistant'
+            if role in ['user', 'assistant']:
+                messages.append({'role': role, 'content': msg['content']})
         
         # Get AI response
         try:
@@ -746,7 +818,7 @@ class ChatCLI:
             )
             ai_response = response.choices[0].message.content
         except Exception as e:
-            ai_response = f"Error: {str(e)}"
+            return f"Error: {str(e)}"
         
         # Write AI response
         asst_msg = [{
@@ -834,8 +906,11 @@ class ChatCLI:
             self.handle_convo([])
         elif args[0] == 'new':
             name = args[1] if len(args) > 1 else None
-            convo_id = self.create_convo(name)
-            print(f"Created conversation: {convo_id}")
+            try:
+                convo_id = self.create_convo(name)
+                print(f"Created conversation: {convo_id}")
+            except ValueError as e:
+                print(e)
         elif args[0] == 'fork':
             if not self.current_convo:
                 print("No conversation to fork")
@@ -844,14 +919,13 @@ class ChatCLI:
             # TODO: Implement forking
             print("Forking not yet implemented")
         else:
-            # Switch to existing conversation
+            # Switch to existing conversation by context-local symlink name
             convo_name = args[0]
             convos_dir = self.current_context / 'convos'
             symlink_path = convos_dir / f"{convo_name}.yaml"
-            
+
             if symlink_path.exists() and symlink_path.is_symlink():
-                target = symlink_path.readlink()
-                convo_id = target.name
+                convo_id = symlink_path.resolve().name
                 self.set_context_convo(convo_id)
                 self.save_user_state()
                 print(f"Switched to conversation: {convo_name}")
@@ -975,9 +1049,7 @@ class ChatCLI:
         if args[0] == 'list':
             self.handle_inject([])
         elif args[0] == 'clear':
-            # Clear the local.injected.txt file using shared save function
-            header = "# Local injected files for this context\n# Add files to inject, comment out with # to disable\n"
-            if self.save_injected_file(local_injected_path, [], header=header, mode='write'):
+            if self.save_injected_file(local_injected_path, [], mode='write'):
                 self.write_meta_update()
                 print("Cleared injected files")
             else:
@@ -990,10 +1062,6 @@ class ChatCLI:
             
             # Remove from local.injected.txt using shared save function
             try:
-                # Read existing lines and filter out the target file
-                existing_injections = self.load_injected_file(local_injected_path, base_context=self.current_context, check_duplicates=False)
-                filtered_injections = [inj['file'] for inj in existing_injections if inj['file'] != file_path]
-                
                 # Also read raw lines to preserve comments and formatting
                 raw_lines = []
                 if local_injected_path.exists():
@@ -1019,19 +1087,21 @@ class ChatCLI:
             # Inject specific file
             file_path = args[0]
             
-            # Support both lab-root-relative and current-context-relative paths
+            # Support both context-relative and cwd-relative paths, but persist relative paths
             if file_path.startswith('./'):
-                # Current context relative (./main.py)
                 full_path = self.current_context / file_path[2:]
-                stored_path = str(full_path)
+                stored_path = file_path
             else:
-                # Relative to current working directory (ideas/cli/main.py)
                 full_path = Path.cwd() / file_path
-                stored_path = str(full_path)
+                try:
+                    stored_path = f"./{full_path.relative_to(self.current_context)}"
+                except ValueError:
+                    print("Injected files must resolve inside the current context; use ./path/from/context")
+                    return
                 
             if full_path.exists():
                 # Append to local.injected.txt using shared save function
-                if self.save_injected_file(local_injected_path, [file_path], mode='append'):
+                if self.save_injected_file(local_injected_path, [stored_path], mode='append'):
                     self.write_meta_update()
                     print(f"Injected file: {stored_path}")
                 else:
@@ -1057,7 +1127,7 @@ class ChatCLI:
             model_name, endpoint = model_name.split(':', 1)
             if endpoint in self.config['endpoints']:
                 self.current_endpoint = endpoint
-                self.setup_openai()
+                self.setup_llm()
             else:
                 print(f"Unknown endpoint: {endpoint}")
                 return
@@ -1160,13 +1230,6 @@ class ChatCLI:
         print("Type /help for commands, /quit to exit")
         print()
         
-        pending_message = self.get_pending_user_message()
-        if pending_message is not None:
-            self.retry_message = pending_message
-            print("Pending user message detected; press Enter to retry or edit before sending")
-        else:
-            self.retry_message = ''
-        
         while True:
             try:
                 # Show status
@@ -1174,7 +1237,7 @@ class ChatCLI:
                 print(f"\n{status}")
                 
                 # Get input
-                line = self.session.prompt(">>> ", default=self.retry_message).strip()
+                line = self.session.prompt(">>> ").strip()
 
                 if not line:
                     continue
