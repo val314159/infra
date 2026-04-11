@@ -73,6 +73,7 @@ Examples:
 '''
 
 import os
+import shlex
 import sys
 import uuid
 import yaml as pyyaml
@@ -794,7 +795,7 @@ class ChatCLI:
         
         # Write AI response
         asst_msg = [{
-            'role': 'asst',
+            'role': 'assistant',
             'content': ai_response,
             'timestamp': datetime.datetime.now().isoformat() + 'Z'
         }]
@@ -1197,6 +1198,23 @@ class ChatCLI:
             parts.append(f"messages: {message_count}")
         
         return ' | '.join(parts)
+
+    def page_response(self, response: str) -> None:
+        """Show a response through the user's pager, falling back to stdout."""
+        response_path = Path('.response')
+        response_path.write_text(response + '\n')
+
+        pager = os.environ.get('PAGER', 'less')
+        pager_cmd = shlex.split(pager) if pager else []
+
+        if not pager_cmd:
+            print(f"\n{response}")
+            return
+
+        try:
+            subprocess.run([*pager_cmd, str(response_path)])
+        except Exception:
+            print(f"\n{response}")
     
     def run(self):
         """Main chat loop."""
@@ -1251,7 +1269,7 @@ class ChatCLI:
                 
                 # Send message and show response
                 response = self.send_message(line)
-                print(f"\n{response}")
+                self.page_response(response)
                 
             except KeyboardInterrupt:
                 print("\nUse /quit to exit")
@@ -1297,7 +1315,7 @@ class ChatCLI:
         if function_name in tool_index:
             try:
                 result = tool_index[function_name](**arguments)
-                print(f"DEBUG: Tool execution result: {result}")
+                print(f"DEBUG: Tool execution result: {repr(result)[:40]}...")
                 return {"result": result, "success": True}
             except Exception as e:
                 print(f"DEBUG: Tool execution error: {e}")

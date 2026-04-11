@@ -1,11 +1,12 @@
 import subprocess as _subp
+from pathlib import Path as _Path
 
 def shell(cmd):
     """Execute shell command in Docker container and return structured result for tool calling."""    
     try:
-        #print("SHELL:", cmd)
         result = _subp.run(
-            ["docker", "exec", "-it", "sandbox", "sh", "-c", cmd],  # Use sh instead of bash
+            ["docker", "exec", "-it", "-w", _Path.cwd(),
+             "sandbox", "sh", "-c", cmd],
             capture_output=True, 
             text=True,  
             timeout=30,  # Prevent hanging
@@ -16,22 +17,16 @@ def shell(cmd):
             "exit_code": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "command": cmd,
-            "environment": "docker:sandbox"
         }
     except _subp.TimeoutExpired:
         return {
             "success": False,
             "error": "Command timed out after 30 seconds",
-            "command": cmd,
-            "environment": "docker:sandbox"
         }
     except Exception as e:
         return {
             "success": False,
             "error": str(e),
-            "command": cmd,
-            "environment": "docker:sandbox"
         }
 shell.tool_signature = {
     "type": "function",
