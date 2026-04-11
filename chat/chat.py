@@ -572,7 +572,7 @@ class ChatCLI:
                 context_parts.append(f"Error reading injected file: {e}")
             context_parts.append("</injected>")
             context_parts.append("")
-        
+
         # Add context info
         context_parts.append(f"=== CURRENT CONTEXT ===")
         context_parts.append(f"Directory: {self.current_context}")
@@ -820,6 +820,19 @@ class ChatCLI:
 
         return content
     
+    def chat(self, messages, stream, use_tools=True):
+        tools = self.get_available_tools() if use_tools else None
+        print("TOOLS", tools)
+        response = self.client.chat.completions.create(
+            model=self.current_model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.7,
+            extra_body={"options": {"num_ctx": 256*1024}}
+        )
+        return response
+
     def send_message(self, message: str) -> str:
         """Send a message to the AI and get response."""
         if not self.current_convo:
@@ -865,14 +878,8 @@ class ChatCLI:
             #print(f"DEBUG: Sending {len(tools)} tools to AI:")
             #for i, tool in enumerate(tools):
             #    print(f"DEBUG: Tool {i}: {tool.get('function', {}).get('name', 'unknown')}")
-            
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto" if tools else None,
-                temperature=0.7
-            )
+
+            response = self.chat(messages, False)
             
             # Handle tool calls
             if response.choices[0].message.tool_calls:
@@ -1415,7 +1422,7 @@ class ChatCLI:
                 
                 for tool_call in response.choices[0].message.tool_calls:
                     result = self.execute_tool_call(tool_call)
-                    print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
+                    #print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -1434,13 +1441,7 @@ class ChatCLI:
                 # Get next AI response
                 try:
                     print(f"DEBUG: Sending tool results to AI for next response")
-                    response = self.client.chat.completions.create(
-                        model=self.current_model,
-                        messages=messages,
-                        tools=self.get_available_tools(),
-                        tool_choice="auto",
-                        temperature=0.7
-                    )
+                    response = self.chat(messages, False)
                     
                     # Check if AI wants to make more tool calls
                     if response.choices[0].message.tool_calls:

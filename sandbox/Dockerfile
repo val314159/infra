@@ -5,3 +5,4 @@ RUN pip install --break-system-packages \
     docopt-ng pyaml
 RUN pip install --break-system-packages \
     prompt-toolkit openai
+ENV PAGER=cat
