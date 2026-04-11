@@ -88,7 +88,91 @@ from docopt import docopt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
-from .tools import __index__ as tool_index
+
+
+# =============================================================================
+# INLINED TOOLS
+# =============================================================================
+
+def bounce_sandbox(path: str):
+    """restart sandbox with new path"""
+    result = subprocess.run(
+        ["docker", "rm", "-f", "sandbox"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    result = subprocess.run(
+        ["docker", "run", "-d",
+         "-v", f"{path}:{path}", "-w", path,
+         "--name", "sandbox", "sandbox"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    print(result)
+    return result
+
+def shell_tool(cmd: str) -> Dict[str, Any]:
+    """Execute shell command in Docker container and return structured result for tool calling."""    
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-it", "-w", str(Path.cwd()),
+             "sandbox", "sh", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return {
+            "success": result.returncode == 0,
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": "Command timed out after 30 seconds",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+shell_tool.tool_signature = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Execute shell commands in "
+        "a Docker container (sandbox) using sh and return "
+        "structured results with success status, "
+        "stdout, stderr, and exit code. "
+        "Supports shell variables, pipes, "
+        "and standard POSIX shell features.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "Shell command to "
+                    "execute in the Docker container"
+                }
+            },
+            "required": ["cmd"]
+        }
+    }
+}
+
+# Tool index - inlined from tools module
+TOOL_INDEX = {
+    "shell": shell_tool,
+}
+
+
+# =============================================================================
+# END INLINED TOOLS
+# =============================================================================
 
 class ChatCLI:
     # Unix permission constants (core architectural choices)
@@ -207,6 +291,8 @@ class ChatCLI:
         # Save the change
         self.save_context_state()
         self.save_user_state()
+
+        bounce_sandbox(str(new_context))
         
         return old_context
 
@@ -757,7 +843,7 @@ class ChatCLI:
         
         # Add history
         for msg in history:
-            if msg['role'] in ['user', 'assistant']:
+            if msg['role'] in ['user', 'assistant', 'tool']:
                 messages.append({'role': msg['role'], 'content': msg['content']})
         
         # Add current message
@@ -768,9 +854,9 @@ class ChatCLI:
         try:
             # Get available tools
             tools = self.get_available_tools()
-            print(f"DEBUG: Sending {len(tools)} tools to AI:")
-            for i, tool in enumerate(tools):
-                print(f"DEBUG: Tool {i}: {tool.get('function', {}).get('name', 'unknown')}")
+            #print(f"DEBUG: Sending {len(tools)} tools to AI:")
+            #for i, tool in enumerate(tools):
+            #    print(f"DEBUG: Tool {i}: {tool.get('function', {}).get('name', 'unknown')}")
             
             response = self.client.chat.completions.create(
                 model=self.current_model,
@@ -1150,11 +1236,6 @@ class ChatCLI:
             print(f"prompts: {prompts_str}")
         print(f"model:   {self.current_model} ({self.current_endpoint})")
         
-        if self.current_convo:
-            history = self.load_convo_history()
-            message_count = len([msg for msg in history if msg['role'] in ['user', 'asst']])
-            print(f"messages: {message_count}")
-    
     def show_history(self):
         """Show conversation history."""
         if not self.current_convo:
@@ -1165,8 +1246,10 @@ class ChatCLI:
         for msg in history:
             if msg['role'] == 'user':
                 print(f"User: {msg['content']}")
-            elif msg['role'] == 'asst':
-                print(f"Assistant: {msg['content']}")
+            elif msg['role'] == 'assistant':
+                print(f"Asst: {msg['content']}")
+            elif msg['tool'] == 'tool':
+                print(f"Tool: {msg['content']}")
             print()
     
     def show_help(self):
@@ -1191,11 +1274,6 @@ class ChatCLI:
             parts.append(f"prompts: {prompts_str}")
         
         parts.append(f"model: {self.current_model}")
-        
-        if self.current_convo:
-            history = self.load_convo_history()
-            message_count = len([msg for msg in history if msg['role'] in ['user', 'asst']])
-            parts.append(f"messages: {message_count}")
         
         return ' | '.join(parts)
 
@@ -1280,41 +1358,28 @@ class ChatCLI:
                 print(f"Error: {e}")
 
     def get_available_tools(self) -> List[Dict]:
-        """Get available tools from tool index."""
+        """Get available tools from inlined TOOL_INDEX."""
         tool_list = []
         
-        # Import tools module to get __index__
-        try:
-            from . import tools
-            #print(f"DEBUG: tools module imported successfully")
-            #print(f"DEBUG: __index__ has {len(tools.__index__)} tools: {list(tools.__index__.keys())}")
-            
-            # Loop through __index__ to find tool signatures
-            for tool_name, func in tools.__index__.items():
-                #print(f"DEBUG: Checking tool: {tool_name} in function: {func}")
-                if hasattr(func, 'tool_signature'):
-                    tool_signature = getattr(func, 'tool_signature')
-                    #print(f"DEBUG: Found tool signature for {tool_name}: {tool_signature.get('function', {}).get('name', 'unknown')}")
-                    tool_list.append(tool_signature)
-                else:
-                    print(f"DEBUG: No tool_signature found for {tool_name}")                 
-        except ImportError as e:
-            print(f"DEBUG: Failed to import tools module: {e}")
+        # Loop through TOOL_INDEX to find tool signatures
+        for tool_name, func in TOOL_INDEX.items():
+            if hasattr(func, 'tool_signature'):
+                tool_signature = getattr(func, 'tool_signature')
+                tool_list.append(tool_signature)
         
-        #print(f"DEBUG: Total tools loaded: {len(tool_list)}")
         return tool_list
     
     def execute_tool_call(self, tool_call) -> Dict[str, Any]:
-        """Execute a tool call using the tool index."""
+        """Execute a tool call using the inlined TOOL_INDEX."""
         function_name = tool_call.function.name
         arguments = json.loads(tool_call.function.arguments)
         
         print(f"DEBUG: Executing tool: {function_name} with args: {arguments}")
         
-        # Look up function in tool_index
-        if function_name in tool_index:
+        # Look up function in TOOL_INDEX
+        if function_name in TOOL_INDEX:
             try:
-                result = tool_index[function_name](**arguments)
+                result = TOOL_INDEX[function_name](**arguments)
                 print(f"DEBUG: Tool execution result: {repr(result)[:40]}...")
                 return {"result": result, "success": True}
             except Exception as e:
@@ -1363,14 +1428,15 @@ class ChatCLI:
                     response = self.client.chat.completions.create(
                         model=self.current_model,
                         messages=messages,
-                        tools=self.get_available_tools(),  # Keep tools available for more calls
+                        tools=self.get_available_tools(),
                         tool_choice="auto",
                         temperature=0.7
                     )
                     
                     # Check if AI wants to make more tool calls
                     if response.choices[0].message.tool_calls:
-                        print(f"DEBUG: AI wants to make more tool calls: {len(response.choices[0].message.tool_calls)}")
+                        print(f"DEBUG: AI wants to make more tool calls:",
+                              len(response.choices[0].message.tool_calls))
                         continue  # Continue the loop for more tool calls
                     else:
                         print(f"DEBUG: AI is done with tool calls, providing final response")
@@ -1393,24 +1459,19 @@ class ChatCLI:
         
         # Write final tool interaction to conversation
         tool_msg = [{
-            'role': 'asst',
+            'role': 'assistant',
             'content': ai_response,
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
             'iterations': iteration,
         }]
-        self.write_convo_file(convo_dir, tool_msg, 'asst')
+        self.write_convo_file(convo_dir, tool_msg, 'tool')
         
         return ai_response
 
 def main():
     """Main entry point for the CLI."""
     args = docopt(__doc__, version=f'Lab Infra Chat CLI {__version__}')
-    
     config_path = args.get('--config')
-    if config_path == 'infra/config/chat.yaml':
-        # Default path - let the CLI figure out the full path
-        config_path = None
-    
     cli = ChatCLI(config_path)
     cli.run()
 
