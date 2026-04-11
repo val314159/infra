@@ -922,10 +922,9 @@ class ChatCLI:
         
         # Switch to specific context
         old_convo = self.current_convo
-
         new_context = (Path.cwd() / path).resolve()
-        print("NC", new_context)
-        print("NC", new_context)
+        print(f"Switching to {new_context}...")
+
         if new_context.exists() and new_context.is_dir():
 
             old_context = self.set_current_context(new_context)
