@@ -26,7 +26,7 @@ Description:
   - Status line showing current state
 """
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
 HELP_MESSAGE = '''Lab Infra Chat CLI Commands
 
@@ -96,21 +96,26 @@ from prompt_toolkit.history import FileHistory
 
 def bounce_sandbox(path: str):
     """restart sandbox with new path"""
+    print("rm old sandbox")
     result = subprocess.run(
         ["docker", "rm", "-f", "sandbox"],
         capture_output=True,
         text=True,
         timeout=30,
     )
+    print("launch new sandbox")
+    gitp = f"{path}/.git"
     result = subprocess.run(
-        ["docker", "run", "-d",
+        ["docker", "run", "-d", "--rm",
          "-v", f"{path}:{path}", "-w", path,
-         "--name", "sandbox", "sandbox"],
+         "-v", f"{gitp}:{gitp}:ro",
+         "--name", "sandbox", "sandbox",
+         "sleep", "5000000000"],
         capture_output=True,
         text=True,
         timeout=30,
     )
-    print(result)
+    print("new sandbox up!", result)
     return result
 
 def shell_tool(cmd: str) -> Dict[str, Any]:
@@ -250,7 +255,10 @@ class ChatCLI:
         self.setup_completion()
 
         # Setup OpenAI client
-        endpoint_config = self.config['endpoints'][self.current_endpoint]        
+        self.setup_openai()
+
+    def setup_openai(self):
+        endpoint_config = self.config['endpoints'][self.current_endpoint]
         if (api_key := endpoint_config['key_env']).isupper():
             if not (api_key := os.getenv(api_key)):
                 raise ValueError(f"Missing {api_key} environment variable")
@@ -909,6 +917,38 @@ class ChatCLI:
         
         return history
     
+    def switch_context(self, path):
+        """Perform context switching."""
+        
+        # Switch to specific context
+        old_convo = self.current_convo
+
+        new_context = (Path.cwd() / path).resolve()
+        print("NC", new_context)
+        print("NC", new_context)
+        if new_context.exists() and new_context.is_dir():
+
+            old_context = self.set_current_context(new_context)
+            
+            self.load_context_state()  # Load context after changing directory
+
+            new_convo = self.current_convo
+            new_context_rel = str(self.current_context)
+
+            if old_convo:
+                leave_meta: Dict[str, Any] = {
+                    'timestamp': datetime.datetime.now().isoformat() + 'Z',
+                    'event': 'switch_context',
+                    'from_context': str(old_context),
+                    'to_context': new_context_rel,
+                    'to_convo': new_convo,
+                }
+                old_convo_dir = self.get_convo_path(old_convo)
+                self.write_convo_file(old_convo_dir, leave_meta, 'meta')
+            print(f"Switched to context: {new_context}")
+        else:
+            print(f"Context '{path}' not found")
+    
     def dispatch_command(self, line: str) -> bool:
         """Handle slash commands. Returns True if command was handled."""
         if not line.startswith('/'):
@@ -1012,45 +1052,15 @@ class ChatCLI:
     
     def handle_switch(self, args: List[str]):
         """Handle context switching."""
-        if not args:
+        if not args or args[0] == 'list':
             # List available contexts (subdirectories of current directory)
             print("Available contexts:")
             for item in Path.cwd().iterdir():
                 if item.is_dir() and not item.name.startswith('.'):
                     marker = " (current)" if item == self.current_context else ""
                     print(f"  {item.name}{marker}")
-            return
-        
-        if args[0] == 'list':
-            self.handle_switch([])
-            return
-        
-        # Switch to specific context
-        old_convo = self.current_convo
-        old_context_rel = str(self.current_context)
-
-        new_context = Path.cwd() / args[0]
-        if new_context.exists() and new_context.is_dir():
-            old_context = self.set_current_context(new_context)  # Centralized chdir
-            
-            self.load_context_state()  # Load context after changing directory
-
-            new_convo = self.current_convo
-            new_context_rel = str(self.current_context)
-
-            if old_convo:
-                leave_meta: Dict[str, Any] = {
-                    'timestamp': datetime.datetime.now().isoformat() + 'Z',
-                    'event': 'switch_context',
-                    'from_context': str(old_context),
-                    'to_context': new_context_rel,
-                    'to_convo': new_convo,
-                }
-                old_convo_dir = self.get_convo_path(old_convo)
-                self.write_convo_file(old_convo_dir, leave_meta, 'meta')
-            print(f"Switched to context: {new_context}")
         else:
-            print(f"Context '{args[0]}' not found")
+            self.switch_context(args[0])
     
     def handle_prompts(self):
         """List available prompts."""
