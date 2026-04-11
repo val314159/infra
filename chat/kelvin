@@ -1,4 +1,1 @@
-#!/bin/sh
-PYTHONPATH=~/.local/lib
-PYTHONSAFEPATH=1
-python3.11 -P -m chat.chat
+PYTHONPATH=~/.local/lib python -P -m chat.chat
