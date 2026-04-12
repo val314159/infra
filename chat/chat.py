@@ -245,7 +245,7 @@ class ChatCLI:
         self.current_context_state = {}
 
         self.load_user_state()
-        self.load_context_state()
+        #self.load_context_state()
         
         # Ensure directories exist
         self.ensure_dir(self.convos_dir)
@@ -304,7 +304,7 @@ class ChatCLI:
         
         return old_context
 
-    def load_context_state(self):
+    def load_context_state(self, bounce=True):
         context_state_file = self.get_context_state_file()
         
         state = self.load_json_file(context_state_file, {})
@@ -330,11 +330,12 @@ class ChatCLI:
                     break
 
         self.current_convo = selected
-        
-        # If we have a saved context directory, change to it
-        saved_context = state.get('context_directory')
-        if saved_context and Path(saved_context).exists():
-            self.set_current_context(Path(saved_context))
+
+        if bounce:
+            # If we have a saved context directory, change to it
+            saved_context = state.get('context_directory')
+            if saved_context and Path(saved_context).exists():
+                self.set_current_context(Path(saved_context))
 
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
@@ -926,7 +927,6 @@ class ChatCLI:
     
     def switch_context(self, path):
         """Perform context switching."""
-        
         # Switch to specific context
         old_convo = self.current_convo
         new_context = (Path.cwd() / path).resolve()
@@ -936,7 +936,7 @@ class ChatCLI:
 
             old_context = self.set_current_context(new_context)
             
-            self.load_context_state()  # Load context after changing directory
+            self.load_context_state(False)  # Load context after changing directory
 
             new_convo = self.current_convo
             new_context_rel = str(self.current_context)
