@@ -78,7 +78,6 @@ import sys
 import uuid
 import yaml as pyyaml
 import json
-import glob
 import subprocess
 import datetime
 from pathlib import Path
@@ -88,6 +87,8 @@ from docopt import docopt
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
+
+YAML_PAT = '[0-9]*.yaml'
 
 def ensure_dir(path: Path) -> None:
     """Ensure directory exists."""
@@ -203,11 +204,12 @@ TOOL_INDEX = {
 # END INLINED TOOLS
 # =============================================================================
 
+PERM_IMMUTABLE = 0o444  # read-only for all
+PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
+PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
+
 class ChatCLI:
     # Unix permission constants (core architectural choices)
-    PERM_IMMUTABLE = 0o444  # read-only for all
-    PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
-    PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
 
     def lab_home(self) -> Path:
         return Path.home() / '.lab'
@@ -224,37 +226,24 @@ class ChatCLI:
     
     def __init__(self, config_path: str):
         self.config = self.load_config(config_path)
-
         self.context = Path.cwd()
         self.convos_dir = self.lab_home() / 'convos'
         self.prompts_dir = self.lab_home() / 'prompts'
         self.state_file = self.lab_home() / 'chat_state.json'
         self.first_convo: Optional[str] = None
-        
-        # Current state
         self.convo = None
         self.prompts = []
         self.model = self.config['default_model']
         self.endpoint = self.config['default_endpoint']
         self.retry_message: Optional[str] = ''
         self.tool_processing = False  # Track when processing tools
-
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
-
-        # Initialize context state before loading
         self.context_state = {}
-
         self.load_user_state()
         self.load_context_state()
-        
-        # Ensure directories exist
         ensure_dir(self.convos_dir)
-        
-        # Setup history and prompt tooling
         self.setup_history()
         self.setup_completion()
-
-        # Setup OpenAI client
         self.setup_openai()
 
     def setup_openai(self):
@@ -268,16 +257,13 @@ class ChatCLI:
         state = load_json_file(self.state_file)
         if state is None:
             return
-
         ctx = state.get('last_context')
         if isinstance(ctx, str):
             candidate = Path(ctx)
             if not candidate.is_absolute():
                 candidate = Path.cwd() / ctx
-
             if candidate.exists() and candidate.is_dir():
                 self.set_context(candidate)  # Use centralized method to chdir
-
         fc = state.get('first_convo')
         if isinstance(fc, str) and fc:
             self.first_convo = fc
@@ -286,14 +272,10 @@ class ChatCLI:
         """Set current context and change working directory."""
         old_context = self.context
         self.context = new_context
-
         os.chdir(new_context)  # Single place for chdir
-        
         # Save pointer to new context
         self.save_user_state()
-
         bounce_sandbox(str(new_context))
-        
         return old_context
 
     def save_user_state(self):
@@ -306,20 +288,16 @@ class ChatCLI:
 
     def load_context_state(self):
         context_state_file = self.get_context_state_file()
-        
         state = load_json_file(context_state_file, {})
         if not isinstance(state, dict):
             state = {}
-
         self.context_state = state
-
         # Find last conversation for this context
         last_convo = state.get('last_convo')
         if isinstance(last_convo, str) and last_convo:
             candidates = [last_convo]
         else:
             candidates = []
-
         # Try to find a valid conversation
         selected = None
         for candidate in candidates:
@@ -328,23 +306,18 @@ class ChatCLI:
                 if convo_dir.exists() and convo_dir.is_dir():
                     selected = candidate
                     break
-
         self.convo = selected
 
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
         context_state_file = self.get_context_state_file()
-        
         save_json_file(context_state_file, self.context_state)
 
     def set_context_convo(self, convo_id: Optional[str]):
         self.convo = convo_id
-
         if not self.context_state:
             self.context_state = {}
-
         self.context_state['last_convo'] = convo_id
-
         self.save_context_state()
 
     def load_config(self, config_path: str) -> Dict:
@@ -366,7 +339,6 @@ class ChatCLI:
             'auto_inject_makefile': True,   
             'restore_last_convo': True
         }
-
         # Load user config from ~/.lab/config.yaml
         user_config_path = self.lab_home() / 'config.yaml'
         if user_config_path.exists():
@@ -385,7 +357,6 @@ class ChatCLI:
                 print(f"Created default config at: {user_config_path}")
             except Exception:
                 print(f"Warning: Failed to create default config at {user_config_path}")
-        
         # Override with explicit config path if provided
         if config_path and os.path.exists(config_path):
             try:
@@ -394,7 +365,6 @@ class ChatCLI:
                 default_config.update(loaded_config)
             except Exception:
                 print(f"Warning: Failed to load config from {config_path}")
-        
         return default_config
     
     def setup_completion(self):
@@ -405,26 +375,22 @@ class ChatCLI:
             def get_completions(self, document, complete_event):
                 text = document.text_before_cursor
                 words = text.split()
-                
                 # No input - complete commands
                 if not text:
                     for cmd in commands:
                         yield Completion(cmd, start_position=0)
                     return
-                
                 # Complete command names
                 if len(words) == 1 and text.startswith('/'):
                     for cmd in commands:
                         if cmd.startswith(text):
                             yield Completion(cmd, start_position=-len(text))
                     return
-                
                 # Complete command arguments
                 if len(words) >= 2 and words[0].startswith('/'):
                     cmd = words[0]
                     arg = words[-1]
                     start_pos = -len(arg)
-                    
                     try:
                         if cmd == '/switch':
                             # Complete directories from current working directory
@@ -457,12 +423,9 @@ class ChatCLI:
                                 for item in base_path.glob(arg + '*'):
                                     rel_path = str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
-                    
                     except Exception:
                         pass  # Silently fail completion
-                
                 return
-
         self_outer = self
         self.prompt_completer = ChatCompleter()
         self.session = PromptSession(history=self.prompt_history, completer=self.prompt_completer)
@@ -474,51 +437,22 @@ class ChatCLI:
         ensure_dir(self.history_file.parent)
         self.prompt_history = FileHistory(str(self.history_file))
 
-    def append_history_line(self, line: str):
-        if not line:
-            return
-        try:
-            with open(self.history_file, 'a', encoding='utf-8') as f:
-                f.write(line.replace('\n', ' ') + '\n')
-                f.flush()
-                os.fsync(f.fileno())
-                return
-        except Exception:
-            print(f"Warning: Failed to write history file: {self.history_file}")
-            return
-
     def get_next_file_number(self, convo_dir: Path) -> str:
         """Get next sequence number for conversation file."""
-        existing = list(convo_dir.glob('*.yaml'))
+        existing = list(convo_dir.glob(YAML_PAT))
         if not existing:
-            return '0001'
-        
-        # Extract numeric part from filenames like "0001-meta.yaml"
-        numbers = []
-        for f in existing:
-            stem = f.stem
-            if '-' in stem:
-                num_part = stem.split('-')[0]
-            else:
-                num_part = stem
-            try:
-                numbers.append(int(num_part))
-            except ValueError:
-                print(f"Warning: Failed to parse number from {num_part}")
-                continue
-        
-        if not numbers:
-            return '0001'
-        
-        max_num = max(numbers)
-        return f"{max_num + 1:04d}"
+            return f"{1:04d}"
+        existing.sort()
+        num_part = existing[-1].stem.split('-', 1)[0]
+        next_val = int(num_part, 10) + 1
+        return f"{next_val:04d}"
 
-    def build_meta_state(self, *, include_title: bool = False, title: Optional[str] = None, convo_id: Optional[str] = None) -> Dict[str, Any]:
-        context_rel = str(self.context)
-
+    def build_meta_state(self, *, include_title: bool = False,
+                         title: Optional[str] = None,
+                         convo_id: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
-            'context': context_rel,
+            'context': str(self.context),
             'model': self.model,
             'endpoint': self.endpoint,
             'prompts': [
@@ -529,26 +463,21 @@ class ChatCLI:
                 } for prompt in self.prompts
             ]
         }
-
         if convo_id is not None:
             payload['uuid'] = convo_id
-
         if include_title:
             if title is not None:
                 payload['title'] = title
-
         return payload
 
     def build_context(self) -> str:
         """Build the full context for the AI."""
         context_parts = []
-        
         # Add prompts
         for prompt in self.prompts:
             context_parts.append(f"=== PROMPT: {prompt['name']} v{prompt['version']} ===")
             context_parts.append(prompt['snapshot'])
             context_parts.append("")
-        
         # Add injected files
         for injected in self.get_injected_files():
             context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
@@ -560,36 +489,33 @@ class ChatCLI:
                 context_parts.append(f"Error reading injected file: {e}")
             context_parts.append("</injected>")
             context_parts.append("")
-
         # Add context info
         context_parts.append(f"=== CURRENT CONTEXT ===")
         context_parts.append(f"Directory: {self.context}")
         context_parts.append(f"Conversation: {self.convo or 'None'}")
         context_parts.append(f"Model: {self.model} ({self.endpoint})")
         context_parts.append("")
-        
         return "\n".join(context_parts)
 
     def write_convo_file(self, convo_dir: Path, content: Any, file_type: str):
         """Write a conversation file and make it immutable."""
         filename = f"{self.get_next_file_number(convo_dir)}-{file_type}.yaml"
         filepath = convo_dir / filename
-        
         with open(filepath, 'w') as f:
             pyyaml.dump(content, f, default_flow_style=False)
-
         # Make immutable
-        os.chmod(filepath, self.PERM_IMMUTABLE)
+        os.chmod(filepath, PERM_IMMUTABLE)
 
     def write_meta_update(self):
         if not self.convo:
             return
-
         convo_dir = self.get_convo_path(self.convo)
         meta = self.build_meta_state(convo_id=self.convo)
         self.write_convo_file(convo_dir, meta, 'meta')
 
-    def load_injected_file(self, file_path: Path, base_context: Path = None, check_duplicates: bool = False) -> List[Dict[str, Any]]:
+    def load_injected_file(self, file_path: Path,
+                           base_context: Path = None,
+                           check_duplicates: bool = False) -> List[Dict[str, Any]]:
         """Load injected files from a text file with # comments and ./ convention.
         
         Args:
@@ -602,16 +528,12 @@ class ChatCLI:
         """
         if not file_path.exists():
             return []
-        
         if base_context is None:
             base_context = self.context
-            
         injected_files = []
         seen = set()
-        
         if check_duplicates:
             seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
-        
         try:
             with open(file_path, 'r') as f:
                 for line in f:
@@ -619,7 +541,6 @@ class ChatCLI:
                     # Skip empty lines and comments
                     if not line or line.startswith('#'):
                         continue
-                    
                     # Handle different path conventions
                     if line.startswith('./'):
                         # Context-relative: ./main.py
@@ -641,7 +562,6 @@ class ChatCLI:
                         else:
                             print(f"Warning: Path {line} does not exist, skipping")
                             continue
-                    
                     # Check file existence and duplicates
                     if Path(stored_path).exists():
                         if not check_duplicates or stored_path not in seen:
@@ -652,13 +572,11 @@ class ChatCLI:
                             seen.add(stored_path)
         except Exception:
             print(f"Warning: Failed to load injected file from {file_path}")
-        
         return injected_files
 
     def get_injected_files(self) -> List[Dict[str, Any]]:
         """Get all injected files by reading from disk (no caching)."""
         injected_files: List[Dict[str, Any]] = []
-
         # Auto-inject Makefile
         if self.config.get('auto_inject_makefile', True):
             makefile_path = self.context / 'Makefile'
@@ -667,19 +585,17 @@ class ChatCLI:
                     'file': str(makefile_path),
                     'injected_at': datetime.datetime.now().isoformat() + 'Z'
                 })
-
         # Auto-injected files from injected.txt
         injected_txt_path = self.context / 'injected.txt'
         injected_files.extend(self.load_injected_file(injected_txt_path))
-        
         # Manual injections from local.injected.txt
         local_injected_path = self.context / 'convos' / 'local.injected.txt'
         manual_injections = self.load_injected_file(local_injected_path, check_duplicates=False)
         injected_files.extend(manual_injections)
-        
         return injected_files
 
-    def save_injected_file(self, file_path: Path, injections: List[str], header: str = None, mode: str = 'write') -> bool:
+    def save_injected_file(self, file_path: Path, injections: List[str],
+                           header: str = None, mode: str = 'write') -> bool:
         """Save injections to a text file with proper formatting.
         
         Args:
@@ -693,7 +609,6 @@ class ChatCLI:
         """
         try:
             ensure_dir(file_path.parent)
-            
             if mode == 'append':
                 with open(file_path, 'a') as f:
                     if header and not file_path.exists():
@@ -716,21 +631,16 @@ class ChatCLI:
         convo_id = str(uuid.uuid4())
         convo_dir = self.get_convo_path(convo_id)
         convo_dir.mkdir(exist_ok=True)
-        
         if name is None:
             name = f"convo-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        
         meta = self.build_meta_state(include_title=True, title=name, convo_id=convo_id)
         meta['fork_of'] = None
         meta['fork_at'] = None
         meta['tags'] = []
         meta['status'] = 'active'
-        
         self.write_convo_file(convo_dir, meta, 'meta')
-        
         # Create symlink in current context
         self.create_convo_symlink(convo_id, name)
-        
         self.set_context_convo(convo_id)
         if not self.first_convo:
             self.first_convo = convo_id
@@ -741,16 +651,13 @@ class ChatCLI:
         """Create symlink to conversation in current context."""
         context_convos_dir = self.context / 'convos'
         context_convos_dir.mkdir(exist_ok=True)
-        
         # Sanitize name for filename
         safe_name = name.lower().replace(' ', '-').replace('/', '-')
         symlink_path = context_convos_dir / f"{safe_name}.yaml"
         target_path = self.get_convo_path(convo_id)
-        
         # Remove existing symlink if it exists
         if symlink_path.exists():
             symlink_path.unlink()
-        
         # Create relative symlink
         relative_target = os.path.relpath(target_path, context_convos_dir)
         symlink_path.symlink_to(relative_target)
@@ -758,20 +665,16 @@ class ChatCLI:
     def load_prompt(self, prompt_name: str) -> Dict:
         """Load a prompt from the prompt library."""
         prompt_path = None
-        
         # Search in system, templates, then workflows
         for subdir in ['system', 'templates', 'workflows']:
             candidate = self.prompts_dir / subdir / f"{prompt_name}.md"
             if candidate.exists():
                 prompt_path = candidate
                 break
-        
         if not prompt_path:
             raise ValueError(f"Prompt '{prompt_name}' not found")
-        
         with open(prompt_path, 'r') as f:
             content = f.read()
-        
         # Parse frontmatter
         if content.startswith('---'):
             parts = content.split('---', 2)
@@ -784,28 +687,22 @@ class ChatCLI:
                     'snapshot': body,
                     'frontmatter': frontmatter
                 }
-        
         raise ValueError(f"Invalid prompt format in {prompt_name}")
 
     def get_pending_user_message(self) -> Optional[str]:
         if not self.convo:
             return None
-
         history = self.load_convo_history()
         if not history:
             return None
-
         last = history[-1]
         if not isinstance(last, dict):
             return None
-
         if last.get('role') != 'user':
             return None
-
         content = last.get('content')
         if not isinstance(content, str):
             return None
-
         return content
     
     def chat(self, messages, stream, use_tools=True):
@@ -825,13 +722,10 @@ class ChatCLI:
         """Send a message to the AI and get response."""
         if not self.convo:
             self.create_convo()
-        
         convo_dir = self.get_convo_path(self.convo)
-
         pending_message = self.retry_message
         retry_this_turn = bool(pending_message is not None and pending_message == message)
         self.retry_message = ''
-        
         if not retry_this_turn:
             user_msg = [{
                 'role': 'user',
@@ -839,36 +733,26 @@ class ChatCLI:
                 'timestamp': datetime.datetime.now().isoformat() + 'Z'
             }]
             self.write_convo_file(convo_dir, user_msg, 'user')
-        
         # Build full context
         full_context = self.build_context()
-        
         # Add conversation history
         history = self.load_convo_history()
         messages = []
-        
         # Add system context
         messages.append({'role': 'system', 'content': full_context})
-        
         # Add history
         for msg in history:
             if msg['role'] in ['user', 'assistant', 'tool']:
                 messages.append({'role': msg['role'], 'content': msg['content']})
-        
         # Add current message
         if not retry_this_turn:
             messages.append({'role': 'user', 'content': message})
-        
         # Get AI response with tool calling
         try:
             # Get available tools
             tools = self.get_available_tools()
             #print(f"DEBUG: Sending {len(tools)} tools to AI:")
-            #for i, tool in enumerate(tools):
-            #    print(f"DEBUG: Tool {i}: {tool.get('function', {}).get('name', 'unknown')}")
-
             response = self.chat(messages, False)
-            
             # Handle tool calls
             if response.choices[0].message.tool_calls:
                 print(f"DEBUG: AI made {len(response.choices[0].message.tool_calls)} tool calls:")
@@ -878,10 +762,8 @@ class ChatCLI:
             else:
                 print("DEBUG: AI did not make any tool calls")
                 ai_response = response.choices[0].message.content
-                
         except Exception as e:
             ai_response = f"Error: {str(e)}"
-        
         # Write AI response
         asst_msg = [{
             'role': 'assistant',
@@ -889,27 +771,21 @@ class ChatCLI:
             'timestamp': datetime.datetime.now().isoformat() + 'Z'
         }]
         self.write_convo_file(convo_dir, asst_msg, 'asst')
-        
         return ai_response
     
     def load_convo_history(self) -> List[Dict]:
         """Load conversation history."""
         if not self.convo:
             return []
-        
         convo_dir = self.get_convo_path(self.convo)
         history = []
-        
-        for filepath in sorted(convo_dir.glob('*.yaml')):
+        for filepath in sorted(convo_dir.glob(YAML_PAT)):
             if filepath.name.endswith('-meta.yaml'):
                 continue
-            
             with open(filepath, 'r') as f:
                 content = pyyaml.safe_load(f)
-            
             if isinstance(content, list) and content:
                 history.extend(content)
-        
         return history
     
     def switch_context(self, path):
@@ -918,16 +794,11 @@ class ChatCLI:
         old_convo = self.convo
         new_context = (Path.cwd() / path).resolve()
         print(f"Switching to {new_context}...")
-
         if new_context.exists() and new_context.is_dir():
-
             old_context = self.set_context(new_context)
-            
             self.load_context_state()  # Load context after changing directory
-
             new_convo = self.convo
             new_context_rel = str(self.context)
-
             if old_convo:
                 leave_meta: Dict[str, Any] = {
                     'timestamp': datetime.datetime.now().isoformat() + 'Z',
@@ -946,11 +817,9 @@ class ChatCLI:
         """Handle slash commands. Returns True if command was handled."""
         if not line.startswith('/'):
             return False
-        
         parts = line.split()
         command = parts[0]
         args = parts[1:] if len(parts) > 1 else []
-        
         if command == '/help':
             self.show_help()
         elif command == '/show':
@@ -976,7 +845,6 @@ class ChatCLI:
             self.show_history()
         else:
             print(f"Unknown command: {command}")
-        
         return True
     
     def handle_convo(self, args: List[str]):
@@ -986,15 +854,13 @@ class ChatCLI:
             convos_dir = self.context / 'convos'
             if convos_dir.exists():
                 print("Conversations in this context:")
-                for symlink in convos_dir.glob('*.yaml'):
+                for symlink in convos_dir.glob(YAML_PAT):
                     if symlink.is_symlink():
                         target = symlink.readlink()
                         print(f"  {symlink.stem} -> {target}")
             else:
                 print("No conversations in this context")
-            return
-        
-        if args[0] == 'list':
+        elif args[0] == 'list':
             self.handle_convo([])
         elif args[0] == 'new':
             name = args[1] if len(args) > 1 else None
@@ -1003,16 +869,15 @@ class ChatCLI:
         elif args[0] == 'fork':
             if not self.convo:
                 print("No conversation to fork")
-                return
-            name = args[1] if len(args) > 1 else None
-            # TODO: Implement forking
-            print("Forking not yet implemented")
+            else:
+                name = args[1] if len(args) > 1 else None
+                # TODO: Implement forking
+                print("Forking not yet implemented")
         else:
             # Switch to existing conversation
             convo_name = args[0]
             convos_dir = self.context / 'convos'
             symlink_path = convos_dir / f"{convo_name}.yaml"
-            
             if symlink_path.exists() and symlink_path.is_symlink():
                 target = symlink_path.readlink()
                 convo_id = target.name
@@ -1030,9 +895,7 @@ class ChatCLI:
             print("  status   - Show current status")
             print("  history  - Show conversation history")
             return
-        
         subcommand = args[0]
-        
         if subcommand == 'config':
             self.show_config()
         elif subcommand == 'status':
@@ -1072,8 +935,7 @@ class ChatCLI:
             for prompt in self.prompts:
                 print(f"  {prompt['name']} v{prompt['version']}")
             return
-        
-        if args[0] == 'add':
+        elif args[0] == 'add':
             if len(args) < 2:
                 print("Usage: /prompt add <prompt_name>")
                 return
@@ -1099,13 +961,11 @@ class ChatCLI:
     def handle_inject(self, args: List[str]):
         """Handle file injection using local.injected.txt."""
         local_injected_path = self.context / 'convos' / 'local.injected.txt'
-        
         if not args:
             print("Currently injected files:")
             for injected in self.get_injected_files():
                 print(f"  {injected['file']}")
             return
-        
         if args[0] == 'list':
             self.handle_inject([])
         elif args[0] == 'clear':
@@ -1121,30 +981,25 @@ class ChatCLI:
                 print("Usage: /inject drop <file>")
                 return
             file_path = args[1]
-            
             # Remove from local.injected.txt using shared save function
             try:
                 # Read existing lines and filter out the target file
                 existing_injections = self.load_injected_file(local_injected_path, base_context=self.context, check_duplicates=False)
                 filtered_injections = [inj['file'] for inj in existing_injections if inj['file'] != file_path]
-                
                 # Also read raw lines to preserve comments and formatting
                 raw_lines = []
                 if local_injected_path.exists():
                     with open(local_injected_path, 'r') as f:
                         raw_lines = f.readlines()
-                
                 # Filter raw lines, preserving comments
                 filtered_lines = []
                 for line in raw_lines:
                     stripped = line.strip()
                     if stripped != file_path and not stripped.startswith('# ' + file_path):
                         filtered_lines.append(line)
-                
                 # Write back the filtered content
                 with open(local_injected_path, 'w') as f:
                     f.writelines(filtered_lines)
-                
                 self.write_meta_update()
                 print(f"Dropped injected file: {file_path}")
             except Exception:
@@ -1152,7 +1007,6 @@ class ChatCLI:
         else:
             # Inject specific file
             file_path = args[0]
-            
             # Support both lab-root-relative and current-context-relative paths
             if file_path.startswith('./'):
                 # Current context relative (./main.py)
@@ -1162,7 +1016,6 @@ class ChatCLI:
                 # Relative to current working directory (ideas/cli/main.py)
                 full_path = Path.cwd() / file_path
                 stored_path = str(full_path)
-                
             if full_path.exists():
                 # Append to local.injected.txt using shared save function
                 if self.save_injected_file(local_injected_path, [file_path], mode='append'):
@@ -1178,13 +1031,11 @@ class ChatCLI:
         if not args:
             print(f"Current model: {self.model} ({self.endpoint})")
             return
-        
-        if args[0] == 'list':
+        elif args[0] == 'list':
             print("Available endpoints:")
             for endpoint in self.config['endpoints']:
                 print(f"  {endpoint}")
             return
-        
         # Switch model
         model_name = args[0]
         if ':' in model_name:
@@ -1195,7 +1046,6 @@ class ChatCLI:
             else:
                 print(f"Unknown endpoint: {endpoint}")
                 return
-        
         self.model = model_name
         self.write_meta_update()
         print(f"Switched to model: {model_name} ({self.endpoint})")
@@ -1209,19 +1059,16 @@ class ChatCLI:
         print(f"  Prompt Library: {self.prompts_dir}")
         print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
         print(f"  History File: {self.history_file}")
-        
         if self.convo:
             print(f"  Current Conversation: {self.convo}")
         else:
             print("  Current Conversation: None")
-        
         if self.prompts:
             print(f"  Active Prompts: {len(self.prompts)}")
             for prompt in self.prompts:
                 print(f"    - {prompt['name']} v{prompt['version']}")
         else:
             print("  Active Prompts: None")
-        
         injected_files = self.get_injected_files()
         if injected_files:
             print(f"  Injected Files: {len(injected_files)}")
@@ -1244,7 +1091,6 @@ class ChatCLI:
         if not self.convo:
             print("No active conversation")
             return
-        
         history = self.load_convo_history()
         for msg in history:
             if msg['role'] == 'user':
@@ -1263,7 +1109,6 @@ class ChatCLI:
         """Generate status line for display."""
         parts = []
         parts.append(f"context: {self.context}")
-        
         if self.convo:
             convo_dir = self.get_convo_path(self.convo)
             meta_file = convo_dir / '0001-meta.yaml'
@@ -1271,27 +1116,21 @@ class ChatCLI:
                 with open(meta_file, 'r') as f:
                     meta = pyyaml.safe_load(f)
                 parts.append(f"convo: {meta['title']} ({self.convo[:8]})")
-        
         if self.prompts:
             prompts_str = ', '.join([f"{p['name']}" for p in self.prompts])
             parts.append(f"prompts: {prompts_str}")
-        
         parts.append(f"model: {self.model}")
-        
         return ' | '.join(parts)
 
     def page_response(self, response: str) -> None:
         """Show a response through the user's pager, falling back to stdout."""
         response_path = Path('.response')
         response_path.write_text(response + '\n')
-
         pager = os.environ.get('PAGER', 'less')
         pager_cmd = shlex.split(pager) if pager else []
-
         if not pager_cmd:
             print(f"\n{response}")
             return
-
         try:
             subprocess.run([*pager_cmd, str(response_path)])
         except Exception:
@@ -1302,28 +1141,21 @@ class ChatCLI:
         print("Welcome to Lab Infra Chat CLI")
         print("Type /help for commands, /quit to exit")
         print()
-        
         pending_message = self.get_pending_user_message()
         if pending_message is not None:
             self.retry_message = pending_message
             print("Pending user message detected; press Enter to retry or edit before sending")
         else:
             self.retry_message = ''
-        
         while True:
             try:
                 # Show status right before asking for input
                 status = self.get_status_line()
                 print(f"\n{status}")
-                
                 # Get input
                 line = self.session.prompt(">>> ", default=self.retry_message).strip()
-
                 if not line:
                     continue
-
-                self.append_history_line(line)
-
                 if line.startswith('!'):
                     cmd = line[1:].strip()
                     if not cmd:
@@ -1343,15 +1175,12 @@ class ChatCLI:
                     except Exception as e:
                         print(f"Shell error: {e}")
                     continue
-                
                 # Handle commands
                 if self.dispatch_command(line):
                     continue
-                
                 # Send message and show response
                 response = self.send_message(line)
                 self.page_response(response)
-                
             except KeyboardInterrupt:
                 print("\nUse /quit to exit")
             except EOFError:
@@ -1363,22 +1192,18 @@ class ChatCLI:
     def get_available_tools(self) -> List[Dict]:
         """Get available tools from inlined TOOL_INDEX."""
         tool_list = []
-        
         # Loop through TOOL_INDEX to find tool signatures
         for tool_name, func in TOOL_INDEX.items():
             if hasattr(func, 'tool_signature'):
                 tool_signature = getattr(func, 'tool_signature')
                 tool_list.append(tool_signature)
-        
         return tool_list
     
     def execute_tool_call(self, tool_call) -> Dict[str, Any]:
         """Execute a tool call using the inlined TOOL_INDEX."""
         function_name = tool_call.function.name
         arguments = json.loads(tool_call.function.arguments)
-        
         print(f"DEBUG: Executing tool: {function_name} with args: {arguments}")
-        
         # Look up function in TOOL_INDEX
         if function_name in TOOL_INDEX:
             try:
@@ -1396,17 +1221,13 @@ class ChatCLI:
         """Handle tool calls and continue conversation with multi-turn support."""
         max_iterations = 10  # Prevent infinite loops
         iteration = 0
-        
         while iteration < max_iterations:
             iteration += 1
             print(f"DEBUG: Tool call iteration {iteration}")
-            
             tool_results = []
-            
             # Execute each tool call in this round
             if response.choices[0].message.tool_calls:
                 print(f"DEBUG: Processing {len(response.choices[0].message.tool_calls)} tool calls")
-                
                 for tool_call in response.choices[0].message.tool_calls:
                     result = self.execute_tool_call(tool_call)
                     #print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
@@ -1416,20 +1237,15 @@ class ChatCLI:
                         "name": tool_call.function.name,
                         "content": json.dumps(result)
                     })
-                
                 print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
-                
                 # Add AI's tool call request to messages
                 messages.append(response.choices[0].message)
-                
                 # Add tool results to messages
                 messages.extend(tool_results)
-                
                 # Get next AI response
                 try:
                     print(f"DEBUG: Sending tool results to AI for next response")
                     response = self.chat(messages, False)
-                    
                     # Check if AI wants to make more tool calls
                     if response.choices[0].message.tool_calls:
                         print(f"DEBUG: AI wants to make more tool calls:",
@@ -1439,7 +1255,6 @@ class ChatCLI:
                         print(f"DEBUG: AI is done with tool calls, providing final response")
                         ai_response = response.choices[0].message.content
                         break  # Exit the loop
-                        
                 except Exception as e:
                     print(f"DEBUG: Error getting AI response: {e}")
                     ai_response = f"Error after tool execution: {str(e)}"
@@ -1448,12 +1263,9 @@ class ChatCLI:
                 # No tool calls in this response
                 ai_response = response.choices[0].message.content
                 break
-        
         if iteration >= max_iterations:
             ai_response = "Error: Too many tool call iterations, possible infinite loop"
-        
         print(f"DEBUG: Final AI response after {iteration} iterations: {ai_response[:200]}...")
-        
         # Write final tool interaction to conversation
         tool_msg = [{
             'role': 'assistant',
@@ -1462,7 +1274,6 @@ class ChatCLI:
             'iterations': iteration,
         }]
         self.write_convo_file(convo_dir, tool_msg, 'tool')
-        
         return ai_response
 
 def main():
