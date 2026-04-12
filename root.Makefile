@@ -1,5 +1,5 @@
 
-infra::	
+infra::
 	uv run --env-file $@/.env --project $@ $@
 
 clean::
@@ -8,10 +8,5 @@ clean::
 
 realclean:: clean
 	@make -C infra $@
-
-reset::
-	rm -fr infra/convos/[0-9a0z]*
-	rm -fr */*/convo
-	rm -fr ~/.lab
-	@make -C infra realclean
-
+reset:
+	rm -fr ~/.lab infra/convos/[0-9a-z]* ideas/cli/convos

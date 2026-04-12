@@ -1,0 +1,1344 @@
+#!/usr/bin/env python3
+"""
+Lab Infra Chat CLI
+
+A readline-based chat interface for AI conversations with persistent storage,
+prompt composition, and filesystem navigation.
+
+Usage:
+  chat.py [--config=<path>] [--help] [--version]
+
+Options:
+  --config=<path>    Path to configuration file [default: infra/config/chat.yaml]
+  --help             Show this help message
+  --version          Show version
+
+Description:
+  The Lab Infra Chat CLI provides an interactive interface for AI conversations
+  with persistent storage, composable prompts, and filesystem navigation.
+  
+  Features:
+  - OpenAI-compatible HTTP (works with OpenAI, Ollama, and vllm)
+  - Composable prompt system with snapshots
+  - Persistent conversations as immutable numbered files
+  - Slash commands for navigation and control
+  - Tab completion for commands and filenames
+  - Status line showing current state
+"""
+
+__version__ = '0.1.2'
+
+HELP_MESSAGE = '''Lab Infra Chat CLI Commands
+
+Conversation:
+  /convo [name|uuid]       Change or list conversations
+  /convo new [name]        Start new conversation
+  /convo list              List conversations in current context
+
+Navigation:
+  /switch [path]           Change context directory
+  /switch list             List available contexts
+
+Prompts:
+  /prompts                 List available prompts
+  /prompt add [name]       Add prompt to current conversation
+  /prompt drop [name]      Remove prompt from current conversation
+
+Injection:
+  /inject [file]           Inject file into context
+  /inject list             Show currently injected files
+  /inject drop [file]      Remove injected file
+  /inject clear            Remove all injected files
+
+Model:
+  /model [name]            Switch model (optionally with endpoint)
+  /model list              List available endpoints
+
+Info:
+  /show config            Show current configuration
+  /show status            Show current state
+  /show history           Show conversation history
+  /status                 Alias for /show status
+  /history                Alias for /show history
+  !<cmd>                  Run a shell command in the current context
+  /help                   Show this help
+  /quit                   Exit the chat
+  /exit                   Alias for /quit
+
+Examples:
+  /switch research/docker
+  /prompt add researcher
+  /inject README.md
+  /model gpt-4o:local
+'''
+
+import os
+import shlex
+import sys
+import uuid
+import yaml as pyyaml
+import json
+import subprocess
+import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Any
+import openai
+from docopt import docopt
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import FileHistory
+
+YAML_PAT = '[0-9]*.yaml'
+
+def ensure_dir(path: Path) -> None:
+    """Ensure directory exists."""
+    path.mkdir(parents=True, exist_ok=True)
+
+def load_json_file(file_path: Path, default: Any = None) -> Any:
+    """Load JSON file with default and error handling."""
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        print(f"Warning: Failed to load {file_path}")
+        return default
+        
+def save_json_file(file_path: Path, data: Any) -> bool:
+    """Save JSON file with error handling."""
+    try:
+        ensure_dir(file_path.parent)
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        return True
+    except Exception:
+        print(f"Warning: Failed to save {file_path}")
+        return False
+
+def bounce_sandbox(path: str):
+    """restart sandbox with new path"""
+    print("rm old sandbox")
+    result = subprocess.run(
+        ["docker", "rm", "-f", "sandbox"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    print("launch new sandbox")
+    gitp = f"{path}/.git"
+    result = subprocess.run(
+        ["docker", "run", "-d", "--rm",
+         "-v", f"{path}:{path}", "-w", path,
+         "-v", f"{gitp}:{gitp}:ro",
+         "--name", "sandbox", "sandbox",
+         "sleep", "5000000000"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    print("new sandbox up!")
+    return result
+
+# =============================================================================
+# INLINED TOOLS
+# =============================================================================
+
+def shell_tool(cmd: str) -> Dict[str, Any]:
+    """Execute shell command in Docker container and return structured result for tool calling."""    
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-it", "-w", str(Path.cwd()),
+             "sandbox", "sh", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return {
+            "success": result.returncode == 0,
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": "Command timed out after 30 seconds",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+shell_tool.tool_signature = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Execute shell commands in "
+        "a Docker container (sandbox) using sh and return "
+        "structured results with success status, "
+        "stdout, stderr, and exit code. "
+        "Supports shell variables, pipes, "
+        "and standard POSIX shell features.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "Shell command to "
+                    "execute in the Docker container"
+                }
+            },
+            "required": ["cmd"]
+        }
+    }
+}
+
+# Tool index - inlined from tools module
+TOOL_INDEX = {
+    "shell": shell_tool,
+}
+
+# =============================================================================
+# END INLINED TOOLS
+# =============================================================================
+
+PERM_IMMUTABLE = 0o444  # read-only for all
+PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
+PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
+
+class ChatCLI:
+    # Unix permission constants (core architectural choices)
+
+    def lab_home(self) -> Path:
+        return Path.home() / '.lab'
+
+    def get_context_convos_dir(self) -> Path:
+        return self.context / 'convos'
+
+    def get_context_state_file(self) -> Path:
+        return self.get_context_convos_dir() / 'context_state.json'
+
+    def get_convo_path(self, convo_id: str) -> Path:
+        """Get path to conversation directory."""
+        return self.convos_dir / convo_id
+    
+    def __init__(self, config_path: str):
+        self.config = self.load_config(config_path)
+        self.context = Path.cwd()
+        self.convos_dir = self.lab_home() / 'convos'
+        self.prompts_dir = self.lab_home() / 'prompts'
+        self.state_file = self.lab_home() / 'chat_state.json'
+        self.first_convo: Optional[str] = None
+        self.convo = None
+        self.prompts = []
+        self.model = self.config['default_model']
+        self.endpoint = self.config['default_endpoint']
+        self.stream = bool(self.config.get('stream', True))
+        self.tool_processing = False  # Track when processing tools
+        self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
+        self.context_state = {}
+        self.load_user_state()
+        self.load_context_state()
+        ensure_dir(self.convos_dir)
+        self.setup_history()
+        self.setup_completion()
+        self.setup_openai()
+
+    def setup_openai(self):
+        endpoint_config = self.config['endpoints'][self.endpoint]
+        if (api_key := endpoint_config['key_env']).isupper():
+            if not (api_key := os.getenv(api_key)):
+                raise ValueError(f"Missing {api_key} environment variable")
+        self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
+        
+    def load_user_state(self):
+        state = load_json_file(self.state_file)
+        if state is None:
+            return
+        ctx = state.get('last_context')
+        if isinstance(ctx, str):
+            candidate = Path(ctx)
+            if not candidate.is_absolute():
+                candidate = Path.cwd() / ctx
+            if candidate.exists() and candidate.is_dir():
+                self.set_context(candidate)  # Use centralized method to chdir
+        fc = state.get('first_convo')
+        if isinstance(fc, str) and fc:
+            self.first_convo = fc
+
+    def set_context(self, new_context: Path):
+        """Set current context and change working directory."""
+        self.context = new_context
+        os.chdir(new_context)  # Single place for chdir
+        # Save pointer to new context
+        self.save_user_state()
+        bounce_sandbox(str(new_context))
+
+    def save_user_state(self):
+        state = {
+            'last_context': str(self.context.resolve()),
+            'first_convo': self.first_convo,
+            'saved_at': datetime.datetime.now().isoformat() + 'Z',
+        }
+        save_json_file(self.state_file, state)
+
+    def load_context_state(self):
+        context_state_file = self.get_context_state_file()
+        state = load_json_file(context_state_file, {})
+        if not isinstance(state, dict):
+            state = {}
+        self.context_state = state
+        # Find last conversation for this context
+        last_convo = state.get('last_convo')
+        if isinstance(last_convo, str) and last_convo:
+            candidates = [last_convo]
+        else:
+            candidates = []
+        # Try to find a valid conversation
+        selected = None
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate:
+                convo_dir = self.get_convo_path(candidate)
+                if convo_dir.exists() and convo_dir.is_dir():
+                    selected = candidate
+                    break
+        self.convo = selected
+
+    def save_context_state(self):
+        context_convos_dir = self.get_context_convos_dir()
+        context_state_file = self.get_context_state_file()
+        save_json_file(context_state_file, self.context_state)
+
+    def set_context_convo(self, convo_id: Optional[str]):
+        self.convo = convo_id
+        if not self.context_state:
+            self.context_state = {}
+        self.context_state['last_convo'] = convo_id
+        self.save_context_state()
+
+    def load_config(self, config_path: str) -> Dict:
+        """Load configuration from YAML file with defaults."""
+        # Default configuration
+        default_config = {
+            'default_model': 'firmen102/qwen3.5-27b',
+            'default_endpoint': 'ollama',
+            'endpoints': {
+                'openai': {
+                    'url': 'https://api.openai.com/v1',
+                    'key_env': 'OPENAI_API_KEY'
+                },
+                'ollama': {
+                    'url': 'http://localhost:11434/v1',
+                    'key_env': 'dummy'
+                }
+            },
+            'stream': True,
+            'auto_inject_makefile': True,   
+            'restore_last_convo': True
+        }
+        # Load user config from ~/.lab/config.yaml
+        user_config_path = self.lab_home() / 'config.yaml'
+        if user_config_path.exists():
+            try:
+                with open(user_config_path, 'r') as f:
+                    loaded_config = pyyaml.safe_load(f)
+                default_config.update(loaded_config)
+            except Exception:
+                print(f"Warning: Failed to load config from {user_config_path}")
+        else:
+            # Write default config so user can see what's available
+            try:
+                ensure_dir(self.lab_home())
+                with open(user_config_path, 'w') as f:
+                    pyyaml.dump(default_config, f, indent=2)
+                print(f"Created default config at: {user_config_path}")
+            except Exception:
+                print(f"Warning: Failed to create default config at {user_config_path}")
+        # Override with explicit config path if provided
+        if config_path and os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    loaded_config = pyyaml.safe_load(f)
+                default_config.update(loaded_config)
+            except Exception:
+                print(f"Warning: Failed to load config from {config_path}")
+        return default_config
+    
+    def setup_completion(self):
+        """Setup prompt-toolkit tab completion."""
+        commands = ['/convo', '/switch', '/prompts', '/prompt', '/inject', '/model', '/show', '/help', '/quit']
+
+        class ChatCompleter(Completer):
+            def get_completions(self, document, complete_event):
+                text = document.text_before_cursor
+                words = text.split()
+                # No input - complete commands
+                if not text:
+                    for cmd in commands:
+                        yield Completion(cmd, start_position=0)
+                    return
+                # Complete command names
+                if len(words) == 1 and text.startswith('/'):
+                    for cmd in commands:
+                        if cmd.startswith(text):
+                            yield Completion(cmd, start_position=-len(text))
+                    return
+                # Complete command arguments
+                if len(words) >= 2 and words[0].startswith('/'):
+                    cmd = words[0]
+                    arg = words[-1]
+                    start_pos = -len(arg)
+                    try:
+                        if cmd == '/switch':
+                            # Complete directories from current working directory
+                            base_path = Path.cwd()
+                            for item in base_path.glob(arg + '*'):
+                                if item.is_dir():
+                                    rel_path = str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                        
+                        elif cmd == '/inject':
+                            # Complete files and directories
+                            if arg.startswith('./'):
+                                # Current context relative
+                                base_path = self_outer.context
+                                search_pattern = arg[2:] + '*'
+                                for item in base_path.glob(search_pattern):
+                                    rel_path = './' + str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                            elif arg.startswith('/'):
+                                # Absolute path completion
+                                if '/' in arg:
+                                    base_path = Path(arg).parent
+                                    search_pattern = Path(arg).name + '*'
+                                    if base_path.exists():
+                                        for item in base_path.glob(search_pattern):
+                                            yield Completion(str(item), start_position=start_pos)
+                            else:
+                                # Relative to current working directory
+                                base_path = Path.cwd()
+                                for item in base_path.glob(arg + '*'):
+                                    rel_path = str(item.relative_to(base_path))
+                                    yield Completion(rel_path, start_position=start_pos)
+                    except Exception:
+                        pass  # Silently fail completion
+                return
+        self_outer = self
+        self.prompt_completer = ChatCompleter()
+        self.session = PromptSession(history=self.prompt_history, completer=self.prompt_completer)
+    
+    def setup_history(self):
+        """Setup command line history persistence."""
+        # History file path
+        self.history_file = self.lab_home() / 'cli-history'
+        ensure_dir(self.history_file.parent)
+        self.prompt_history = FileHistory(str(self.history_file))
+
+    def get_next_file_number(self, convo_dir: Path) -> str:
+        """Get next sequence number for conversation file."""
+        existing = list(convo_dir.glob(YAML_PAT))
+        if not existing:
+            return f"{1:04d}"
+        existing.sort()
+        num_part = existing[-1].stem.split('-', 1)[0]
+        next_val = int(num_part, 10) + 1
+        return f"{next_val:04d}"
+
+    def build_meta_state(self, *, include_title: bool = False,
+                         title: Optional[str] = None,
+                         convo_id: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            'timestamp': datetime.datetime.now().isoformat() + 'Z',
+            'context': str(self.context),
+            'model': self.model,
+            'endpoint': self.endpoint,
+            'prompts': [
+                {
+                    'prompt': prompt['name'],
+                    'version': prompt['version'],
+                    'snapshot': prompt['snapshot']
+                } for prompt in self.prompts
+            ]
+        }
+        if convo_id is not None:
+            payload['uuid'] = convo_id
+        if include_title:
+            if title is not None:
+                payload['title'] = title
+        return payload
+
+    def build_context(self) -> str:
+        """Build the full context for the AI."""
+        context_parts = []
+        # Add prompts
+        for prompt in self.prompts:
+            context_parts.append(f"=== PROMPT: {prompt['name']} v{prompt['version']} ===")
+            context_parts.append(prompt['snapshot'])
+            context_parts.append("")
+        # Add injected files
+        for injected in self.get_injected_files():
+            context_parts.append(f"<injected file=\"{injected['file']}\" injected_at=\"{injected['injected_at']}\">")
+            full_path = Path(injected['file'])
+            try:
+                with open(full_path, 'r') as f:
+                    context_parts.append(f.read())
+            except Exception as e:
+                context_parts.append(f"Error reading injected file: {e}")
+            context_parts.append("</injected>")
+            context_parts.append("")
+        # Add context info
+        context_parts.append(f"=== CURRENT CONTEXT ===")
+        context_parts.append(f"Directory: {self.context}")
+        context_parts.append(f"Conversation: {self.convo or 'None'}")
+        context_parts.append(f"Model: {self.model} ({self.endpoint})")
+        context_parts.append("")
+        return "\n".join(context_parts)
+
+    def write_convo_file(self, convo_dir: Path, content: Any, file_type: str):
+        """Write a conversation file and make it immutable."""
+        filename = f"{self.get_next_file_number(convo_dir)}-{file_type}.yaml"
+        filepath = convo_dir / filename
+        with open(filepath, 'w') as f:
+            pyyaml.dump(content, f, default_flow_style=False)
+        # Make immutable
+        os.chmod(filepath, PERM_IMMUTABLE)
+
+    def write_meta_update(self):
+        if not self.convo:
+            return
+        convo_dir = self.get_convo_path(self.convo)
+        meta = self.build_meta_state(convo_id=self.convo)
+        self.write_convo_file(convo_dir, meta, 'meta')
+
+    def load_injected_file(self, file_path: Path,
+                           base_context: Path = None,
+                           check_duplicates: bool = False) -> List[Dict[str, Any]]:
+        """Load injected files from a text file with # comments and ./ convention.
+        
+        Args:
+            file_path: Path to the injected text file
+            base_context: Base context for resolving ./ paths (defaults to context)
+            check_duplicates: If True, checks against existing injected_files to avoid duplicates
+        
+        Returns:
+            List of injection records with 'file' and 'injected_at' keys
+        """
+        if not file_path.exists():
+            return []
+        if base_context is None:
+            base_context = self.context
+        injected_files = []
+        seen = set()
+        if check_duplicates:
+            seen = {inj.get('file') for inj in self.injected_files if isinstance(inj, dict)}
+        try:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    # Handle different path conventions
+                    if line.startswith('./'):
+                        # Context-relative: ./main.py
+                        full_path = base_context / line[2:]
+                        stored_path = str(full_path)
+                    elif line.startswith('/'):
+                        # Absolute path: /Users/val/project/main.py
+                        abs_path = Path(line)
+                        if abs_path.exists():
+                            stored_path = str(abs_path)
+                        else:
+                            print(f"Warning: Absolute path {line} does not exist, skipping")
+                            continue
+                    else:
+                        # Relative to current working directory: ideas/cli/main.py
+                        full_path = Path.cwd() / line
+                        if full_path.exists():
+                            stored_path = str(full_path)
+                        else:
+                            print(f"Warning: Path {line} does not exist, skipping")
+                            continue
+                    # Check file existence and duplicates
+                    if Path(stored_path).exists():
+                        if not check_duplicates or stored_path not in seen:
+                            injected_files.append({
+                                'file': stored_path,
+                                'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                            })
+                            seen.add(stored_path)
+        except Exception:
+            print(f"Warning: Failed to load injected file from {file_path}")
+        return injected_files
+
+    def get_injected_files(self) -> List[Dict[str, Any]]:
+        """Get all injected files by reading from disk (no caching)."""
+        injected_files: List[Dict[str, Any]] = []
+        # Auto-inject Makefile
+        if self.config.get('auto_inject_makefile', True):
+            makefile_path = self.context / 'Makefile'
+            if makefile_path.exists():
+                injected_files.append({
+                    'file': str(makefile_path),
+                    'injected_at': datetime.datetime.now().isoformat() + 'Z'
+                })
+        # Auto-injected files from injected.txt
+        injected_txt_path = self.context / 'injected.txt'
+        injected_files.extend(self.load_injected_file(injected_txt_path))
+        # Manual injections from local.injected.txt
+        local_injected_path = self.context / 'convos' / 'local.injected.txt'
+        manual_injections = self.load_injected_file(local_injected_path, check_duplicates=False)
+        injected_files.extend(manual_injections)
+        return injected_files
+
+    def save_injected_file(self, file_path: Path, injections: List[str],
+                           header: str = None, mode: str = 'write') -> bool:
+        """Save injections to a text file with proper formatting.
+        
+        Args:
+            file_path: Path to the injected text file
+            injections: List of file paths to inject
+            header: Optional header comment to include
+            mode: 'write' to overwrite, 'append' to append
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            ensure_dir(file_path.parent)
+            if mode == 'append':
+                with open(file_path, 'a') as f:
+                    if header and not file_path.exists():
+                        f.write(f"{header}\n")
+                    for injection in injections:
+                        f.write(f"{injection}\n")
+            else:  # write mode
+                with open(file_path, 'w') as f:
+                    if header:
+                        f.write(f"{header}\n")
+                    for injection in injections:
+                        f.write(f"{injection}\n")
+            return True
+        except Exception:
+            print(f"Warning: Failed to save injected file to {file_path}")
+            return False
+    
+    def create_convo(self, name: str = None) -> str:
+        """Create a new conversation."""
+        convo_id = str(uuid.uuid4())
+        convo_dir = self.get_convo_path(convo_id)
+        convo_dir.mkdir(exist_ok=True)
+        if name is None:
+            name = f"convo-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        meta = self.build_meta_state(include_title=True, title=name, convo_id=convo_id)
+        meta['fork_of'] = None
+        meta['fork_at'] = None
+        meta['tags'] = []
+        meta['status'] = 'active'
+        self.write_convo_file(convo_dir, meta, 'meta')
+        # Create symlink in current context
+        self.create_convo_symlink(convo_id, name)
+        self.set_context_convo(convo_id)
+        if not self.first_convo:
+            self.first_convo = convo_id
+        self.save_user_state()
+        return convo_id
+    
+    def create_convo_symlink(self, convo_id: str, name: str):
+        """Create symlink to conversation in current context."""
+        context_convos_dir = self.context / 'convos'
+        context_convos_dir.mkdir(exist_ok=True)
+        # Sanitize name for filename
+        safe_name = name.lower().replace(' ', '-').replace('/', '-')
+        symlink_path = context_convos_dir / f"{safe_name}.yaml"
+        target_path = self.get_convo_path(convo_id)
+        # Remove existing symlink if it exists
+        if symlink_path.exists():
+            symlink_path.unlink()
+        # Create relative symlink
+        relative_target = os.path.relpath(target_path, context_convos_dir)
+        symlink_path.symlink_to(relative_target)
+    
+    def load_prompt(self, prompt_name: str) -> Dict:
+        """Load a prompt from the prompt library."""
+        prompt_path = None
+        # Search in system, templates, then workflows
+        for subdir in ['system', 'templates', 'workflows']:
+            candidate = self.prompts_dir / subdir / f"{prompt_name}.md"
+            if candidate.exists():
+                prompt_path = candidate
+                break
+        if not prompt_path:
+            raise ValueError(f"Prompt '{prompt_name}' not found")
+        with open(prompt_path, 'r') as f:
+            content = f.read()
+        # Parse frontmatter
+        if content.startswith('---'):
+            parts = content.split('---', 2)
+            if len(parts) >= 3:
+                frontmatter = pyyaml.safe_load(parts[1])
+                body = parts[2].strip()
+                return {
+                    'name': frontmatter['title'],
+                    'version': frontmatter['version'],
+                    'snapshot': body,
+                    'frontmatter': frontmatter
+                }
+        raise ValueError(f"Invalid prompt format in {prompt_name}")
+
+    def chat(self, messages, stream, use_tools=True):
+        tools = self.get_available_tools() if use_tools else None
+        print("TOOLS", tools)
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            stream=stream,
+            temperature=0.7,
+            extra_body={"options": {"num_ctx": 256*1024}}
+        )
+        if not stream:
+            return response.choices[0].message
+        return self.stream_chat(response)
+
+    def stream_chat(self, stream) -> Dict[str, Any]:
+        """Assemble a streamed assistant message while printing content live."""
+        message: Dict[str, Any] = {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [],
+        }
+        printed_content = False
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                print(delta.content, end='', flush=True)
+                message['content'] += delta.content
+                printed_content = True
+
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    idx = tool_call_delta.index or 0
+                    while len(message['tool_calls']) <= idx:
+                        message['tool_calls'].append({
+                            'id': '',
+                            'type': 'function',
+                            'function': {'name': '', 'arguments': ''},
+                        })
+
+                    tool_call = message['tool_calls'][idx]
+                    if tool_call_delta.id:
+                        tool_call['id'] = tool_call_delta.id
+                    if tool_call_delta.type:
+                        tool_call['type'] = tool_call_delta.type
+
+                    fn_delta = tool_call_delta.function
+                    if fn_delta:
+                        if fn_delta.name:
+                            tool_call['function']['name'] += fn_delta.name
+                        if fn_delta.arguments:
+                            tool_call['function']['arguments'] += fn_delta.arguments
+
+        if printed_content:
+            print()
+
+        if not message['content']:
+            message['content'] = None
+        if not message['tool_calls']:
+            message.pop('tool_calls')
+
+        return message
+
+    def get_message_content(self, message: Any) -> Optional[str]:
+        if isinstance(message, dict):
+            return message.get('content')
+        return getattr(message, 'content', None)
+
+    def get_tool_calls(self, message: Any) -> List[Any]:
+        if isinstance(message, dict):
+            tool_calls = message.get('tool_calls') or []
+            return [SimpleNamespace(
+                id=tool_call['id'],
+                type=tool_call.get('type', 'function'),
+                function=SimpleNamespace(
+                    name=tool_call['function']['name'],
+                    arguments=tool_call['function']['arguments'],
+                ),
+            ) for tool_call in tool_calls]
+        return list(getattr(message, 'tool_calls', None) or [])
+
+    def message_to_dict(self, message: Any) -> Dict[str, Any]:
+        if isinstance(message, dict):
+            return message
+        return message.model_dump(exclude_none=True)
+
+    def send_message(self, message: str) -> str:
+        """Send a message to the AI and get response."""
+        if not self.convo:
+            self.create_convo()
+        convo_dir = self.get_convo_path(self.convo)
+        user_msg = [{
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z'
+        }]
+        self.write_convo_file(convo_dir, user_msg, 'user')
+        # Build full context
+        full_context = self.build_context()
+        # Add conversation history
+        history = self.load_convo_history()
+        messages = []
+        # Add system context
+        messages.append({'role': 'system', 'content': full_context})
+        # Add history
+        for msg in history:
+            if msg['role'] in ['user', 'assistant', 'tool']:
+                rec = {'role': msg['role'], 'content': msg.get('content')}
+                if msg['role'] == 'assistant' and 'tool_calls' in msg:
+                    rec['tool_calls'] = msg['tool_calls']
+                if msg['role'] == 'tool':
+                    rec['name'] = msg['name']
+                    rec['tool_call_id'] = msg['tool_call_id']
+                messages.append(rec)
+        # Add current message
+        messages.append({'role': 'user', 'content': message})
+        # Get AI response with tool calling
+        try:
+            # Get available tools
+            tools = self.get_available_tools()
+            #print(f"DEBUG: Sending {len(tools)} tools to AI:")
+            response = self.chat(messages, self.stream)
+            # Handle tool calls
+            tool_calls = self.get_tool_calls(response)
+            if tool_calls:
+                print(f"DEBUG: AI made {len(tool_calls)} tool calls:")
+                for i, tool_call in enumerate(tool_calls):
+                    print(f"DEBUG: Tool call {i}: {tool_call.function.name} with args: {tool_call.function.arguments}")
+                ai_response = self.handle_tool_calls(response, messages, convo_dir)
+            else:
+                print("DEBUG: AI did not make any tool calls")
+                ai_response = self.get_message_content(response) or ''
+        except Exception as e:
+            ai_response = f"Error: {str(e)}"
+        # Write AI response
+        asst_msg = [{
+            'role': 'assistant',
+            'content': ai_response,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z'
+        }]
+        self.write_convo_file(convo_dir, asst_msg, 'asst')
+        return ai_response
+    
+    def load_convo_history(self) -> List[Dict]:
+        """Load conversation history."""
+        if not self.convo:
+            return []
+        convo_dir = self.get_convo_path(self.convo)
+        history = []
+        for filepath in sorted(convo_dir.glob(YAML_PAT)):
+            if filepath.name.endswith('-meta.yaml'):
+                continue
+            with open(filepath, 'r') as f:
+                content = pyyaml.safe_load(f)
+            if isinstance(content, list) and content:
+                history.extend(content)
+        return history
+    
+    def switch_context(self, path):
+        """Perform context switching."""
+        # Switch to specific context
+        old_convo = self.convo
+        old_convo_dir = self.get_convo_path(old_convo)
+        new_context = (Path.cwd() / path).resolve()
+        print(f"Switching to {new_context}...")
+        if new_context.exists() and new_context.is_dir():
+            self.set_context(new_context)
+            self.load_context_state()  # Load context after changing directory
+            new_convo = self.convo
+            new_context_rel = str(self.context)
+            if old_convo:
+                leave_meta: Dict[str, Any] = {
+                    'timestamp': datetime.datetime.now().isoformat() + 'Z',
+                    'event': 'switch_context',
+                    'to_context': new_context_rel,
+                    'to_convo': new_convo,
+                }
+                self.write_convo_file(old_convo_dir, leave_meta, 'meta')
+            print(f"Switched to context: {new_context}")
+        else:
+            print(f"Context '{path}' not found")
+    
+    def dispatch_command(self, line: str) -> bool:
+        """Handle slash commands. Returns True if command was handled."""
+        if not line.startswith('/'):
+            return False
+        parts = line.split()
+        command = parts[0]
+        args = parts[1:] if len(parts) > 1 else []
+        if command == '/help':
+            self.show_help()
+        elif command == '/show':
+            self.handle_show(args)
+        elif command == '/quit' or command == '/exit':
+            print("Goodbye!")
+            sys.exit(0)
+        elif command == '/convo':
+            self.handle_convo(args)
+        elif command == '/switch':
+            self.handle_switch(args)
+        elif command == '/prompts':
+            self.handle_prompts()
+        elif command == '/prompt':
+            self.handle_prompt(args)
+        elif command == '/inject':
+            self.handle_inject(args)
+        elif command == '/model':
+            self.handle_model(args)
+        elif command == '/status':
+            self.show_status()
+        elif command == '/history':
+            self.show_history()
+        else:
+            print(f"Unknown command: {command}")
+        return True
+    
+    def handle_convo(self, args: List[str]):
+        """Handle conversation commands."""
+        if not args:
+            # List conversations in current context
+            convos_dir = self.context / 'convos'
+            if convos_dir.exists():
+                print("Conversations in this context:")
+                for symlink in convos_dir.glob(YAML_PAT):
+                    if symlink.is_symlink():
+                        target = symlink.readlink()
+                        print(f"  {symlink.stem} -> {target}")
+            else:
+                print("No conversations in this context")
+        elif args[0] == 'list':
+            self.handle_convo([])
+        elif args[0] == 'new':
+            name = args[1] if len(args) > 1 else None
+            convo_id = self.create_convo(name)
+            print(f"Created conversation: {convo_id}")
+        elif args[0] == 'fork':
+            if not self.convo:
+                print("No conversation to fork")
+            else:
+                name = args[1] if len(args) > 1 else None
+                # TODO: Implement forking
+                print("Forking not yet implemented")
+        else:
+            # Switch to existing conversation
+            convo_name = args[0]
+            convos_dir = self.context / 'convos'
+            symlink_path = convos_dir / f"{convo_name}.yaml"
+            if symlink_path.exists() and symlink_path.is_symlink():
+                target = symlink_path.readlink()
+                convo_id = target.name
+                self.set_context_convo(convo_id)
+                self.save_user_state()
+                print(f"Switched to conversation: {convo_name}")
+            else:
+                print(f"Conversation '{convo_name}' not found")
+    
+    def handle_show(self, args: List[str]):
+        """Handle show commands."""
+        if not args:
+            print("Usage: /show <subcommand>")
+            print("  config   - Show current configuration")
+            print("  status   - Show current status")
+            print("  history  - Show conversation history")
+            return
+        subcommand = args[0]
+        if subcommand == 'config':
+            self.show_config()
+        elif subcommand == 'status':
+            self.show_status()
+        elif subcommand == 'history':
+            self.show_history()
+        else:
+            print(f"Unknown show subcommand: {subcommand}")
+            print("Available: config, status, history")
+    
+    def handle_switch(self, args: List[str]):
+        """Handle context switching."""
+        if not args or args[0] == 'list':
+            # List available contexts (subdirectories of current directory)
+            print("Available contexts:")
+            for item in Path.cwd().iterdir():
+                if item.is_dir() and not item.name.startswith('.'):
+                    marker = " (current)" if item == self.context else ""
+                    print(f"  {item.name}{marker}")
+        else:
+            self.switch_context(args[0])
+    
+    def handle_prompts(self):
+        """List available prompts."""
+        print("Available prompts:")
+        for subdir in ['system', 'templates', 'workflows']:
+            subdir_path = self.prompts_dir / subdir
+            if subdir_path.exists():
+                print(f"\n{subdir.title()}:")
+                for prompt_file in subdir_path.glob('*.md'):
+                    print(f"  {prompt_file.stem}")
+    
+    def handle_prompt(self, args: List[str]):
+        """Handle prompt management."""
+        if not args:
+            print("Current prompts:")
+            for prompt in self.prompts:
+                print(f"  {prompt['name']} v{prompt['version']}")
+            return
+        elif args[0] == 'add':
+            if len(args) < 2:
+                print("Usage: /prompt add <prompt_name>")
+                return
+            prompt_name = args[1]
+            try:
+                prompt = self.load_prompt(prompt_name)
+                self.prompts.append(prompt)
+                self.write_meta_update()
+                print(f"Added prompt: {prompt_name}")
+            except ValueError as e:
+                print(f"Error: {e}")
+        elif args[0] == 'drop':
+            if len(args) < 2:
+                print("Usage: /prompt drop <prompt_name>")
+                return
+            prompt_name = args[1]
+            self.prompts = [p for p in self.prompts if p['name'] != prompt_name]
+            self.write_meta_update()
+            print(f"Dropped prompt: {prompt_name}")
+        else:
+            print("Unknown prompt command. Use: add, drop")
+    
+    def handle_inject(self, args: List[str]):
+        """Handle file injection using local.injected.txt."""
+        local_injected_path = self.context / 'convos' / 'local.injected.txt'
+        if not args:
+            print("Currently injected files:")
+            for injected in self.get_injected_files():
+                print(f"  {injected['file']}")
+            return
+        if args[0] == 'list':
+            self.handle_inject([])
+        elif args[0] == 'clear':
+            # Clear the local.injected.txt file using shared save function
+            header = "# Local injected files for this context\n# Add files to inject, comment out with # to disable\n"
+            if self.save_injected_file(local_injected_path, [], header=header, mode='write'):
+                self.write_meta_update()
+                print("Cleared injected files")
+            else:
+                print(f"Warning: Failed to clear {local_injected_path}")
+        elif args[0] == 'drop':
+            if len(args) < 2:
+                print("Usage: /inject drop <file>")
+                return
+            file_path = args[1]
+            # Remove from local.injected.txt using shared save function
+            try:
+                # Read existing lines and filter out the target file
+                existing_injections = self.load_injected_file(local_injected_path, base_context=self.context, check_duplicates=False)
+                filtered_injections = [inj['file'] for inj in existing_injections if inj['file'] != file_path]
+                # Also read raw lines to preserve comments and formatting
+                raw_lines = []
+                if local_injected_path.exists():
+                    with open(local_injected_path, 'r') as f:
+                        raw_lines = f.readlines()
+                # Filter raw lines, preserving comments
+                filtered_lines = []
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if stripped != file_path and not stripped.startswith('# ' + file_path):
+                        filtered_lines.append(line)
+                # Write back the filtered content
+                with open(local_injected_path, 'w') as f:
+                    f.writelines(filtered_lines)
+                self.write_meta_update()
+                print(f"Dropped injected file: {file_path}")
+            except Exception:
+                print(f"Warning: Failed to drop {file_path} from {local_injected_path}")
+        else:
+            # Inject specific file
+            file_path = args[0]
+            # Support both lab-root-relative and current-context-relative paths
+            if file_path.startswith('./'):
+                # Current context relative (./main.py)
+                full_path = self.context / file_path[2:]
+                stored_path = str(full_path)
+            else:
+                # Relative to current working directory (ideas/cli/main.py)
+                full_path = Path.cwd() / file_path
+                stored_path = str(full_path)
+            if full_path.exists():
+                # Append to local.injected.txt using shared save function
+                if self.save_injected_file(local_injected_path, [file_path], mode='append'):
+                    self.write_meta_update()
+                    print(f"Injected file: {stored_path}")
+                else:
+                    print(f"Warning: Failed to add {stored_path} to {local_injected_path}")
+            else:
+                print(f"File '{file_path}' not found")
+    
+    def handle_model(self, args: List[str]):
+        """Handle model management."""
+        if not args:
+            print(f"Current model: {self.model} ({self.endpoint})")
+            return
+        elif args[0] == 'list':
+            print("Available endpoints:")
+            for endpoint in self.config['endpoints']:
+                print(f"  {endpoint}")
+            return
+        # Switch model
+        model_name = args[0]
+        if ':' in model_name:
+            model_name, endpoint = model_name.split(':', 1)
+            if endpoint in self.config['endpoints']:
+                self.endpoint = endpoint
+                self.setup_openai()
+            else:
+                print(f"Unknown endpoint: {endpoint}")
+                return
+        self.model = model_name
+        self.write_meta_update()
+        print(f"Switched to model: {model_name} ({self.endpoint})")
+
+    def show_config(self):
+        """Show current configuration."""
+        print("Current Configuration:")
+        print(f"  Model: {self.model} ({self.endpoint})")
+        print(f"  Context: {self.context}")
+        print(f"  Conversation Store: {self.convos_dir}")
+        print(f"  Prompt Library: {self.prompts_dir}")
+        print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
+        print(f"  History File: {self.history_file}")
+        if self.convo:
+            print(f"  Current Conversation: {self.convo}")
+        else:
+            print("  Current Conversation: None")
+        if self.prompts:
+            print(f"  Active Prompts: {len(self.prompts)}")
+            for prompt in self.prompts:
+                print(f"    - {prompt['name']} v{prompt['version']}")
+        else:
+            print("  Active Prompts: None")
+        injected_files = self.get_injected_files()
+        if injected_files:
+            print(f"  Injected Files: {len(injected_files)}")
+            for injected in injected_files:
+                print(f"    - {injected['file']}")
+        else:
+            print("  Injected Files: None")
+
+    def show_status(self):
+        """Show current status."""
+        print(f"context: {self.context}")
+        print(f"convo:   {self.convo or 'None'}")
+        if self.prompts:
+            prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.prompts])
+            print(f"prompts: {prompts_str}")
+        print(f"model:   {self.model} ({self.endpoint})")
+        
+    def show_history(self):
+        """Show conversation history."""
+        if not self.convo:
+            print("No active conversation")
+            return
+        history = self.load_convo_history()
+        for msg in history:
+            if msg['role'] == 'user':
+                print(f"User: {msg['content']}")
+            elif msg['role'] == 'assistant':
+                print(f"Asst: {msg['content']}")
+            elif msg['role'] == 'tool':
+                print(f"Tool: {msg['content']}")
+            print()
+    
+    def show_help(self):
+        """Show help information."""
+        print(HELP_MESSAGE)
+    
+    def get_status_line(self) -> str:
+        """Generate status line for display."""
+        parts = []
+        parts.append(f"context: {self.context}")
+        if self.convo:
+            convo_dir = self.get_convo_path(self.convo)
+            meta_file = convo_dir / '0001-meta.yaml'
+            if meta_file.exists():
+                with open(meta_file, 'r') as f:
+                    meta = pyyaml.safe_load(f)
+                parts.append(f"convo: {meta['title']} ({self.convo[:8]})")
+        if self.prompts:
+            prompts_str = ', '.join([f"{p['name']}" for p in self.prompts])
+            parts.append(f"prompts: {prompts_str}")
+        parts.append(f"model: {self.model}")
+        return ' | '.join(parts)
+
+    def page_response(self, response: str) -> None:
+        """Show a response through the user's pager, falling back to stdout."""
+        response_path = Path('.response')
+        response_path.write_text(response + '\n')
+        pager = os.environ.get('PAGER', 'less')
+        pager_cmd = shlex.split(pager) if pager else []
+        if not pager_cmd:
+            print(f"\n{response}")
+            return
+        try:
+            subprocess.run([*pager_cmd, str(response_path)])
+        except Exception:
+            print(f"\n{response}")
+    
+    def run(self):
+        """Main chat loop."""
+        print("Welcome to Lab Infra Chat CLI")
+        print("Type /help for commands, /quit to exit")
+        print()
+        while True:
+            try:
+                # Show status right before asking for input
+                status = self.get_status_line()
+                print(f"\n{status}")
+                # Get input
+                line = self.session.prompt(">>> ").strip()
+                if not line:
+                    continue
+                if line.startswith('!'):
+                    cmd = line[1:].strip()
+                    if not cmd:
+                        continue
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            shell=True,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                        )
+                        if proc.stdout:
+                            print(proc.stdout.rstrip('\n'))
+                        if proc.returncode != 0:
+                            print(f"(exit {proc.returncode})")
+                    except Exception as e:
+                        print(f"Shell error: {e}")
+                    continue
+                # Handle commands
+                if self.dispatch_command(line):
+                    continue
+                # Send message and display according to stream mode
+                response = self.send_message(line)
+                if not self.stream:
+                    self.page_response(response)
+            except KeyboardInterrupt:
+                print("\nUse /quit to exit")
+            except EOFError:
+                print("\nGoodbye!")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+
+    def get_available_tools(self) -> List[Dict]:
+        """Get available tools from inlined TOOL_INDEX."""
+        tool_list = []
+        # Loop through TOOL_INDEX to find tool signatures
+        for tool_name, func in TOOL_INDEX.items():
+            if hasattr(func, 'tool_signature'):
+                tool_signature = getattr(func, 'tool_signature')
+                tool_list.append(tool_signature)
+        return tool_list
+    
+    def execute_tool_call(self, tool_call) -> Dict[str, Any]:
+        """Execute a tool call using the inlined TOOL_INDEX."""
+        function_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+        print(f"DEBUG: Executing tool: {function_name} with args: {arguments}")
+        # Look up function in TOOL_INDEX
+        if function_name in TOOL_INDEX:
+            try:
+                result = TOOL_INDEX[function_name](**arguments)
+                print(f"DEBUG: Tool execution result: {repr(result)[:40]}...")
+                return {"result": result, "success": True}
+            except Exception as e:
+                print(f"DEBUG: Tool execution error: {e}")
+                return {"error": str(e), "success": False}
+        else:
+            print(f"DEBUG: Tool not found in index: {function_name}")
+            return {"error": f"Unknown tool: {function_name}", "success": False}
+    
+    def handle_tool_calls(self, response, messages, convo_dir) -> str:
+        """Handle tool calls and continue conversation with multi-turn support."""
+        max_iterations = 10  # Prevent infinite loops
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"DEBUG: Tool call iteration {iteration}")
+            tool_results = []
+            # Execute each tool call in this round
+            tool_calls = self.get_tool_calls(response)
+            if tool_calls:
+                print(f"DEBUG: Processing {len(tool_calls)} tool calls")
+                assistant_tool_call_msg = self.message_to_dict(response)
+                self.write_convo_file(convo_dir, [assistant_tool_call_msg], 'asst')
+                for tool_call in tool_calls:
+                    result = self.execute_tool_call(tool_call)
+                    #print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
+                    tool_results.append({
+                        'role': 'tool',
+                        'tool_call_id': tool_call.id,
+                        'name': tool_call.function.name,
+                        'content': json.dumps(result),
+                        'timestamp': datetime.datetime.now().isoformat() + 'Z'
+                    })
+                self.write_convo_file(convo_dir, tool_results, 'tool')
+                print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
+                # Add AI's tool call request to messages
+                messages.append(assistant_tool_call_msg)
+                # Add tool results to messages
+                messages.extend(tool_results)
+                # Get next AI response
+                try:
+                    print(f"DEBUG: Sending tool results to AI for next response")
+                    response = self.chat(messages, self.stream)
+                    # Check if AI wants to make more tool calls
+                    next_tool_calls = self.get_tool_calls(response)
+                    if next_tool_calls:
+                        print(f"DEBUG: AI wants to make more tool calls:",
+                              len(next_tool_calls))
+                        continue  # Continue the loop for more tool calls
+                    else:
+                        print(f"DEBUG: AI is done with tool calls, providing final response")
+                        ai_response = self.get_message_content(response) or ''
+                        break  # Exit the loop
+                except Exception as e:
+                    print(f"DEBUG: Error getting AI response: {e}")
+                    ai_response = f"Error after tool execution: {str(e)}"
+                    break
+            else:
+                # No tool calls in this response
+                ai_response = self.get_message_content(response) or ''
+                break
+        if iteration >= max_iterations:
+            ai_response = "Error: Too many tool call iterations, possible infinite loop"
+        print(f"DEBUG: Final AI response after {iteration} iterations: {ai_response[:200]}...")
+        return ai_response
+
+def main():
+    """Main entry point for the CLI."""
+    args = docopt(__doc__, version=f'Lab Infra Chat CLI {__version__}')
+    config_path = args.get('--config')
+    cli = ChatCLI(config_path)
+    cli.run()
+
+if __name__ == '__main__':
+    main()

@@ -1,3 +1,0 @@
-default_model: firmen102/qwen3.5-27b
-default_endpoint: ollama
-lab_root: /home/val/lab

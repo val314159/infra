@@ -1,0 +1,147 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read_csv",
+      "description": "Read and parse a CSV file",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the CSV file"
+          },
+          "delimiter": {
+            "type": "string",
+            "description": "CSV delimiter character",
+            "default": ","
+          },
+          "header": {
+            "type": "boolean",
+            "description": "Whether the CSV has a header row",
+            "default": true
+          },
+          "nrows": {
+            "type": "integer",
+            "description": "Number of rows to read (null for all rows)",
+            "default": null
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "plot_data",
+      "description": "Create a data visualization plot",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Data to plot (CSV file path or inline data)"
+          },
+          "plot_type": {
+            "type": "string",
+            "description": "Type of plot (line, bar, scatter, histogram, box, etc.)",
+            "default": "line"
+          },
+          "x_column": {
+            "type": "string",
+            "description": "Column name for x-axis (for CSV data)"
+          },
+          "y_column": {
+            "type": "string",
+            "description": "Column name for y-axis (for CSV data)"
+          },
+          "title": {
+            "type": "string",
+            "description": "Plot title"
+          },
+          "save_path": {
+            "type": "string",
+            "description": "Path to save the plot image"
+          }
+        },
+        "required": ["data"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_python",
+      "description": "Execute Python code for data analysis",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Python code to execute"
+          },
+          "context": {
+            "type": "string",
+            "description": "Execution context (file path for relative imports)",
+            "default": "."
+          }
+        },
+        "required": ["code"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sql_query",
+      "description": "Execute SQL query on a database",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "SQL query to execute"
+          },
+          "database": {
+            "type": "string",
+            "description": "Database connection string or file path"
+          },
+          "type": {
+            "type": "string",
+            "description": "Database type (sqlite, postgresql, mysql, etc.)",
+            "default": "sqlite"
+          }
+        },
+        "required": ["query", "database"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "analyze_data",
+      "description": "Perform statistical analysis on data",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Data to analyze (CSV file path)"
+          },
+          "analysis_type": {
+            "type": "string",
+            "description": "Type of analysis (describe, correlation, distribution, etc.)",
+            "default": "describe"
+          },
+          "columns": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Specific columns to analyze (empty for all numeric columns)"
+          }
+        },
+        "required": ["data"]
+      }
+    }
+  }
+]
