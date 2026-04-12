@@ -26,7 +26,7 @@ Description:
   - Status line showing current state
 """
 
-__version__ = '0.1.2'
+__version__ = '0.2.0'
 
 HELP_MESSAGE = '''Lab Infra Chat CLI Commands
 
