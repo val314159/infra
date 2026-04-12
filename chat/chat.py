@@ -269,13 +269,11 @@ class ChatCLI:
 
     def set_context(self, new_context: Path):
         """Set current context and change working directory."""
-        old_context = self.context
         self.context = new_context
         os.chdir(new_context)  # Single place for chdir
         # Save pointer to new context
         self.save_user_state()
         bounce_sandbox(str(new_context))
-        return old_context
 
     def save_user_state(self):
         state = {
@@ -722,7 +720,13 @@ class ChatCLI:
         # Add history
         for msg in history:
             if msg['role'] in ['user', 'assistant', 'tool']:
-                messages.append({'role': msg['role'], 'content': msg['content']})
+                rec = {'role': msg['role'], 'content': msg.get('content')}
+                if msg['role'] == 'assistant' and 'tool_calls' in msg:
+                    rec['tool_calls'] = msg['tool_calls']
+                if msg['role'] == 'tool':
+                    rec['name'] = msg['name']
+                    rec['tool_call_id'] = msg['tool_call_id']
+                messages.append(rec)
         # Add current message
         messages.append({'role': 'user', 'content': message})
         # Get AI response with tool calling
@@ -770,10 +774,11 @@ class ChatCLI:
         """Perform context switching."""
         # Switch to specific context
         old_convo = self.convo
+        old_convo_dir = self.get_convo_path(old_convo)
         new_context = (Path.cwd() / path).resolve()
         print(f"Switching to {new_context}...")
         if new_context.exists() and new_context.is_dir():
-            old_context = self.set_context(new_context)
+            self.set_context(new_context)
             self.load_context_state()  # Load context after changing directory
             new_convo = self.convo
             new_context_rel = str(self.context)
@@ -781,11 +786,9 @@ class ChatCLI:
                 leave_meta: Dict[str, Any] = {
                     'timestamp': datetime.datetime.now().isoformat() + 'Z',
                     'event': 'switch_context',
-                    'from_context': str(old_context),
                     'to_context': new_context_rel,
                     'to_convo': new_convo,
                 }
-                old_convo_dir = self.get_convo_path(old_convo)
                 self.write_convo_file(old_convo_dir, leave_meta, 'meta')
             print(f"Switched to context: {new_context}")
         else:
@@ -1075,7 +1078,7 @@ class ChatCLI:
                 print(f"User: {msg['content']}")
             elif msg['role'] == 'assistant':
                 print(f"Asst: {msg['content']}")
-            elif msg['tool'] == 'tool':
+            elif msg['role'] == 'tool':
                 print(f"Tool: {msg['content']}")
             print()
     
@@ -1200,15 +1203,19 @@ class ChatCLI:
             # Execute each tool call in this round
             if response.choices[0].message.tool_calls:
                 print(f"DEBUG: Processing {len(response.choices[0].message.tool_calls)} tool calls")
+                assistant_tool_call_msg = response.choices[0].message.model_dump(exclude_none=True)
+                self.write_convo_file(convo_dir, [assistant_tool_call_msg], 'asst')
                 for tool_call in response.choices[0].message.tool_calls:
                     result = self.execute_tool_call(tool_call)
                     #print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
                     tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": json.dumps(result)
+                        'role': 'tool',
+                        'tool_call_id': tool_call.id,
+                        'name': tool_call.function.name,
+                        'content': json.dumps(result),
+                        'timestamp': datetime.datetime.now().isoformat() + 'Z'
                     })
+                self.write_convo_file(convo_dir, tool_results, 'tool')
                 print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
                 # Add AI's tool call request to messages
                 messages.append(response.choices[0].message)
@@ -1238,14 +1245,6 @@ class ChatCLI:
         if iteration >= max_iterations:
             ai_response = "Error: Too many tool call iterations, possible infinite loop"
         print(f"DEBUG: Final AI response after {iteration} iterations: {ai_response[:200]}...")
-        # Write final tool interaction to conversation
-        tool_msg = [{
-            'role': 'assistant',
-            'content': ai_response,
-            'timestamp': datetime.datetime.now().isoformat() + 'Z',
-            'iterations': iteration,
-        }]
-        self.write_convo_file(convo_dir, tool_msg, 'tool')
         return ai_response
 
 def main():
