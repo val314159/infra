@@ -1,1 +1,0 @@
-PYTHONPATH=~/.local/lib python -P -m chat.chat
