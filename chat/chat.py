@@ -89,10 +89,31 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 
+def ensure_dir(path: Path) -> None:
+    """Ensure directory exists."""
+    path.mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
-# INLINED TOOLS
-# =============================================================================
+def load_json_file(file_path: Path, default: Any = None) -> Any:
+    """Load JSON file with default and error handling."""
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        print(f"Warning: Failed to load {file_path}")
+        return default
+        
+def save_json_file(file_path: Path, data: Any) -> bool:
+    """Save JSON file with error handling."""
+    try:
+        ensure_dir(file_path.parent)
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        return True
+    except Exception:
+        print(f"Warning: Failed to save {file_path}")
+        return False
 
 def bounce_sandbox(path: str):
     """restart sandbox with new path"""
@@ -115,8 +136,12 @@ def bounce_sandbox(path: str):
         text=True,
         timeout=30,
     )
-    print("new sandbox up!", result)
+    print("new sandbox up!")
     return result
+
+# =============================================================================
+# INLINED TOOLS
+# =============================================================================
 
 def shell_tool(cmd: str) -> Dict[str, Any]:
     """Execute shell command in Docker container and return structured result for tool calling."""    
@@ -174,7 +199,6 @@ TOOL_INDEX = {
     "shell": shell_tool,
 }
 
-
 # =============================================================================
 # END INLINED TOOLS
 # =============================================================================
@@ -185,50 +209,26 @@ class ChatCLI:
     PERM_MUTABLE = 0o644    # read-write for owner, read-only for others
     PERM_DIRECTORY = 0o755  # read/write/execute for owner, read/execute for others
 
-    def ensure_dir(self, path: Path) -> None:
-        """Ensure directory exists."""
-        path.mkdir(parents=True, exist_ok=True)
-    
-    def load_json_file(self, file_path: Path, default: Any = None) -> Any:
-        """Load JSON file with default and error handling."""
-        try:
-            with open(file_path, 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return default
-        except Exception:
-            print(f"Warning: Failed to load {file_path}")
-            return default
-    
-    def save_json_file(self, file_path: Path, data: Any) -> bool:
-        """Save JSON file with error handling."""
-        try:
-            self.ensure_dir(file_path.parent)
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-            return True
-        except Exception:
-            print(f"Warning: Failed to save {file_path}")
-            return False
-
-    @property
     def lab_home(self) -> Path:
         return Path.home() / '.lab'
 
-    def get_context_convos_dir(self, context: Optional[Path] = None) -> Path:
-        ctx = context or self.current_context
-        return ctx / 'convos'
+    def get_context_convos_dir(self) -> Path:
+        return self.current_context / 'convos'
 
-    def get_context_state_file(self, context: Optional[Path] = None) -> Path:
-        return self.get_context_convos_dir(context) / 'context_state.json'
+    def get_context_state_file(self) -> Path:
+        return self.get_context_convos_dir() / 'context_state.json'
 
-    def __init__(self, config_path: str = None):
+    def get_convo_path(self, convo_id: str) -> Path:
+        """Get path to conversation directory."""
+        return self.convos_dir / convo_id
+    
+    def __init__(self, config_path: str):
         self.config = self.load_config(config_path)
 
         self.current_context = Path.cwd()
-        self.convos_dir = self.lab_home / 'convos'
-        self.prompts_dir = self.lab_home / 'prompts'
-        self.state_file = self.lab_home / 'chat_state.json'
+        self.convos_dir = self.lab_home() / 'convos'
+        self.prompts_dir = self.lab_home() / 'prompts'
+        self.state_file = self.lab_home() / 'chat_state.json'
         self.first_convo: Optional[str] = None
         
         # Current state
@@ -245,10 +245,10 @@ class ChatCLI:
         self.current_context_state = {}
 
         self.load_user_state()
-        #self.load_context_state()
+        self.load_context_state()
         
         # Ensure directories exist
-        self.ensure_dir(self.convos_dir)
+        ensure_dir(self.convos_dir)
         
         # Setup history and prompt tooling
         self.setup_history()
@@ -265,7 +265,7 @@ class ChatCLI:
         self.client = openai.OpenAI(api_key=api_key, base_url=endpoint_config['url'])
         
     def load_user_state(self):
-        state = self.load_json_file(self.state_file)
+        state = load_json_file(self.state_file)
         if state is None:
             return
 
@@ -282,32 +282,32 @@ class ChatCLI:
         if isinstance(fc, str) and fc:
             self.first_convo = fc
 
-    def save_user_state(self):
-        state = {
-            'last_context': str(self.current_context.resolve()),
-            'first_convo': self.first_convo,
-            'saved_at': datetime.datetime.now().isoformat() + 'Z',
-        }
-        self.save_json_file(self.state_file, state)
-
     def set_current_context(self, new_context: Path):
         """Set current context and change working directory."""
         old_context = self.current_context
         self.current_context = new_context
+
         os.chdir(new_context)  # Single place for chdir
         
-        # Save the change
-        self.save_context_state()
+        # Save pointer to new context
         self.save_user_state()
 
         bounce_sandbox(str(new_context))
         
         return old_context
 
-    def load_context_state(self, bounce=True):
+    def save_user_state(self):
+        state = {
+            'last_context': str(self.current_context.resolve()),
+            'first_convo': self.first_convo,
+            'saved_at': datetime.datetime.now().isoformat() + 'Z',
+        }
+        save_json_file(self.state_file, state)
+
+    def load_context_state(self):
         context_state_file = self.get_context_state_file()
         
-        state = self.load_json_file(context_state_file, {})
+        state = load_json_file(context_state_file, {})
         if not isinstance(state, dict):
             state = {}
 
@@ -331,32 +331,23 @@ class ChatCLI:
 
         self.current_convo = selected
 
-        if bounce:
-            # If we have a saved context directory, change to it
-            saved_context = state.get('context_directory')
-            if saved_context and Path(saved_context).exists():
-                self.set_current_context(Path(saved_context))
-
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
         context_state_file = self.get_context_state_file()
         
-        # Save current context directory for restoration
-        self.current_context_state['context_directory'] = str(self.current_context)
-        
-        self.save_json_file(context_state_file, self.current_context_state)
+        save_json_file(context_state_file, self.current_context_state)
 
     def set_context_convo(self, convo_id: Optional[str]):
         self.current_convo = convo_id
 
-        if not isinstance(getattr(self, 'current_context_state', None), dict):
+        if not self.current_context_state:
             self.current_context_state = {}
 
         self.current_context_state['last_convo'] = convo_id
 
         self.save_context_state()
 
-    def load_config(self, config_path: str = None) -> Dict:
+    def load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file with defaults."""
         # Default configuration
         default_config = {
@@ -377,7 +368,7 @@ class ChatCLI:
         }
 
         # Load user config from ~/.lab/config.yaml
-        user_config_path = self.lab_home / 'config.yaml'
+        user_config_path = self.lab_home() / 'config.yaml'
         if user_config_path.exists():
             try:
                 with open(user_config_path, 'r') as f:
@@ -388,7 +379,7 @@ class ChatCLI:
         else:
             # Write default config so user can see what's available
             try:
-                self.ensure_dir(self.lab_home)
+                ensure_dir(self.lab_home())
                 with open(user_config_path, 'w') as f:
                     pyyaml.dump(default_config, f, indent=2)
                 print(f"Created default config at: {user_config_path}")
@@ -479,8 +470,8 @@ class ChatCLI:
     def setup_history(self):
         """Setup command line history persistence."""
         # History file path
-        self.history_file = self.lab_home / '.cli-history'
-        self.ensure_dir(self.history_file.parent)
+        self.history_file = self.lab_home() / 'cli-history'
+        ensure_dir(self.history_file.parent)
         self.prompt_history = FileHistory(str(self.history_file))
 
     def append_history_line(self, line: str):
@@ -496,10 +487,6 @@ class ChatCLI:
             print(f"Warning: Failed to write history file: {self.history_file}")
             return
 
-    def get_convo_path(self, convo_id: str) -> Path:
-        """Get path to conversation directory."""
-        return self.convos_dir / convo_id
-    
     def get_next_file_number(self, convo_dir: Path) -> str:
         """Get next sequence number for conversation file."""
         existing = list(convo_dir.glob('*.yaml'))
@@ -705,7 +692,7 @@ class ChatCLI:
             True if successful, False otherwise
         """
         try:
-            self.ensure_dir(file_path.parent)
+            ensure_dir(file_path.parent)
             
             if mode == 'append':
                 with open(file_path, 'a') as f:
@@ -936,7 +923,7 @@ class ChatCLI:
 
             old_context = self.set_current_context(new_context)
             
-            self.load_context_state(False)  # Load context after changing directory
+            self.load_context_state()  # Load context after changing directory
 
             new_convo = self.current_convo
             new_context_rel = str(self.current_context)
