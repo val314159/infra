@@ -81,6 +81,7 @@ import json
 import subprocess
 import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any
 import openai
 from docopt import docopt
@@ -235,6 +236,7 @@ class ChatCLI:
         self.prompts = []
         self.model = self.config['default_model']
         self.endpoint = self.config['default_endpoint']
+        self.stream = bool(self.config.get('stream', True))
         self.tool_processing = False  # Track when processing tools
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
         self.context_state = {}
@@ -333,6 +335,7 @@ class ChatCLI:
                     'key_env': 'dummy'
                 }
             },
+            'stream': True,
             'auto_inject_makefile': True,   
             'restore_last_convo': True
         }
@@ -694,10 +697,89 @@ class ChatCLI:
             messages=messages,
             tools=tools,
             tool_choice="auto",
+            stream=stream,
             temperature=0.7,
             extra_body={"options": {"num_ctx": 256*1024}}
         )
-        return response
+        if not stream:
+            return response.choices[0].message
+        return self.stream_chat(response)
+
+    def stream_chat(self, stream) -> Dict[str, Any]:
+        """Assemble a streamed assistant message while printing content live."""
+        message: Dict[str, Any] = {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [],
+        }
+        printed_content = False
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                print(delta.content, end='', flush=True)
+                message['content'] += delta.content
+                printed_content = True
+
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    idx = tool_call_delta.index or 0
+                    while len(message['tool_calls']) <= idx:
+                        message['tool_calls'].append({
+                            'id': '',
+                            'type': 'function',
+                            'function': {'name': '', 'arguments': ''},
+                        })
+
+                    tool_call = message['tool_calls'][idx]
+                    if tool_call_delta.id:
+                        tool_call['id'] = tool_call_delta.id
+                    if tool_call_delta.type:
+                        tool_call['type'] = tool_call_delta.type
+
+                    fn_delta = tool_call_delta.function
+                    if fn_delta:
+                        if fn_delta.name:
+                            tool_call['function']['name'] += fn_delta.name
+                        if fn_delta.arguments:
+                            tool_call['function']['arguments'] += fn_delta.arguments
+
+        if printed_content:
+            print()
+
+        if not message['content']:
+            message['content'] = None
+        if not message['tool_calls']:
+            message.pop('tool_calls')
+
+        return message
+
+    def get_message_content(self, message: Any) -> Optional[str]:
+        if isinstance(message, dict):
+            return message.get('content')
+        return getattr(message, 'content', None)
+
+    def get_tool_calls(self, message: Any) -> List[Any]:
+        if isinstance(message, dict):
+            tool_calls = message.get('tool_calls') or []
+            return [SimpleNamespace(
+                id=tool_call['id'],
+                type=tool_call.get('type', 'function'),
+                function=SimpleNamespace(
+                    name=tool_call['function']['name'],
+                    arguments=tool_call['function']['arguments'],
+                ),
+            ) for tool_call in tool_calls]
+        return list(getattr(message, 'tool_calls', None) or [])
+
+    def message_to_dict(self, message: Any) -> Dict[str, Any]:
+        if isinstance(message, dict):
+            return message
+        return message.model_dump(exclude_none=True)
 
     def send_message(self, message: str) -> str:
         """Send a message to the AI and get response."""
@@ -734,16 +816,17 @@ class ChatCLI:
             # Get available tools
             tools = self.get_available_tools()
             #print(f"DEBUG: Sending {len(tools)} tools to AI:")
-            response = self.chat(messages, False)
+            response = self.chat(messages, self.stream)
             # Handle tool calls
-            if response.choices[0].message.tool_calls:
-                print(f"DEBUG: AI made {len(response.choices[0].message.tool_calls)} tool calls:")
-                for i, tool_call in enumerate(response.choices[0].message.tool_calls):
+            tool_calls = self.get_tool_calls(response)
+            if tool_calls:
+                print(f"DEBUG: AI made {len(tool_calls)} tool calls:")
+                for i, tool_call in enumerate(tool_calls):
                     print(f"DEBUG: Tool call {i}: {tool_call.function.name} with args: {tool_call.function.arguments}")
                 ai_response = self.handle_tool_calls(response, messages, convo_dir)
             else:
                 print("DEBUG: AI did not make any tool calls")
-                ai_response = response.choices[0].message.content
+                ai_response = self.get_message_content(response) or ''
         except Exception as e:
             ai_response = f"Error: {str(e)}"
         # Write AI response
@@ -1153,9 +1236,10 @@ class ChatCLI:
                 # Handle commands
                 if self.dispatch_command(line):
                     continue
-                # Send message and show response
+                # Send message and display according to stream mode
                 response = self.send_message(line)
-                self.page_response(response)
+                if not self.stream:
+                    self.page_response(response)
             except KeyboardInterrupt:
                 print("\nUse /quit to exit")
             except EOFError:
@@ -1201,11 +1285,12 @@ class ChatCLI:
             print(f"DEBUG: Tool call iteration {iteration}")
             tool_results = []
             # Execute each tool call in this round
-            if response.choices[0].message.tool_calls:
-                print(f"DEBUG: Processing {len(response.choices[0].message.tool_calls)} tool calls")
-                assistant_tool_call_msg = response.choices[0].message.model_dump(exclude_none=True)
+            tool_calls = self.get_tool_calls(response)
+            if tool_calls:
+                print(f"DEBUG: Processing {len(tool_calls)} tool calls")
+                assistant_tool_call_msg = self.message_to_dict(response)
                 self.write_convo_file(convo_dir, [assistant_tool_call_msg], 'asst')
-                for tool_call in response.choices[0].message.tool_calls:
+                for tool_call in tool_calls:
                     result = self.execute_tool_call(tool_call)
                     #print(f"DEBUG: Tool result for {tool_call.function.name}: {result}")
                     tool_results.append({
@@ -1218,21 +1303,22 @@ class ChatCLI:
                 self.write_convo_file(convo_dir, tool_results, 'tool')
                 print(f"DEBUG: Tool results to send to AI: {len(tool_results)}")
                 # Add AI's tool call request to messages
-                messages.append(response.choices[0].message)
+                messages.append(assistant_tool_call_msg)
                 # Add tool results to messages
                 messages.extend(tool_results)
                 # Get next AI response
                 try:
                     print(f"DEBUG: Sending tool results to AI for next response")
-                    response = self.chat(messages, False)
+                    response = self.chat(messages, self.stream)
                     # Check if AI wants to make more tool calls
-                    if response.choices[0].message.tool_calls:
+                    next_tool_calls = self.get_tool_calls(response)
+                    if next_tool_calls:
                         print(f"DEBUG: AI wants to make more tool calls:",
-                              len(response.choices[0].message.tool_calls))
+                              len(next_tool_calls))
                         continue  # Continue the loop for more tool calls
                     else:
                         print(f"DEBUG: AI is done with tool calls, providing final response")
-                        ai_response = response.choices[0].message.content
+                        ai_response = self.get_message_content(response) or ''
                         break  # Exit the loop
                 except Exception as e:
                     print(f"DEBUG: Error getting AI response: {e}")
@@ -1240,7 +1326,7 @@ class ChatCLI:
                     break
             else:
                 # No tool calls in this response
-                ai_response = response.choices[0].message.content
+                ai_response = self.get_message_content(response) or ''
                 break
         if iteration >= max_iterations:
             ai_response = "Error: Too many tool call iterations, possible infinite loop"
