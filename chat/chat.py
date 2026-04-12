@@ -26,7 +26,7 @@ Description:
   - Status line showing current state
 """
 
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 
 HELP_MESSAGE = '''Lab Infra Chat CLI Commands
 
@@ -235,7 +235,6 @@ class ChatCLI:
         self.prompts = []
         self.model = self.config['default_model']
         self.endpoint = self.config['default_endpoint']
-        self.retry_message: Optional[str] = ''
         self.tool_processing = False  # Track when processing tools
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
         self.context_state = {}
@@ -689,22 +688,6 @@ class ChatCLI:
                 }
         raise ValueError(f"Invalid prompt format in {prompt_name}")
 
-    def get_pending_user_message(self) -> Optional[str]:
-        if not self.convo:
-            return None
-        history = self.load_convo_history()
-        if not history:
-            return None
-        last = history[-1]
-        if not isinstance(last, dict):
-            return None
-        if last.get('role') != 'user':
-            return None
-        content = last.get('content')
-        if not isinstance(content, str):
-            return None
-        return content
-    
     def chat(self, messages, stream, use_tools=True):
         tools = self.get_available_tools() if use_tools else None
         print("TOOLS", tools)
@@ -723,16 +706,12 @@ class ChatCLI:
         if not self.convo:
             self.create_convo()
         convo_dir = self.get_convo_path(self.convo)
-        pending_message = self.retry_message
-        retry_this_turn = bool(pending_message is not None and pending_message == message)
-        self.retry_message = ''
-        if not retry_this_turn:
-            user_msg = [{
-                'role': 'user',
-                'content': message,
-                'timestamp': datetime.datetime.now().isoformat() + 'Z'
-            }]
-            self.write_convo_file(convo_dir, user_msg, 'user')
+        user_msg = [{
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.datetime.now().isoformat() + 'Z'
+        }]
+        self.write_convo_file(convo_dir, user_msg, 'user')
         # Build full context
         full_context = self.build_context()
         # Add conversation history
@@ -745,8 +724,7 @@ class ChatCLI:
             if msg['role'] in ['user', 'assistant', 'tool']:
                 messages.append({'role': msg['role'], 'content': msg['content']})
         # Add current message
-        if not retry_this_turn:
-            messages.append({'role': 'user', 'content': message})
+        messages.append({'role': 'user', 'content': message})
         # Get AI response with tool calling
         try:
             # Get available tools
@@ -1141,19 +1119,13 @@ class ChatCLI:
         print("Welcome to Lab Infra Chat CLI")
         print("Type /help for commands, /quit to exit")
         print()
-        pending_message = self.get_pending_user_message()
-        if pending_message is not None:
-            self.retry_message = pending_message
-            print("Pending user message detected; press Enter to retry or edit before sending")
-        else:
-            self.retry_message = ''
         while True:
             try:
                 # Show status right before asking for input
                 status = self.get_status_line()
                 print(f"\n{status}")
                 # Get input
-                line = self.session.prompt(">>> ", default=self.retry_message).strip()
+                line = self.session.prompt(">>> ").strip()
                 if not line:
                     continue
                 if line.startswith('!'):
