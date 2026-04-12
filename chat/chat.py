@@ -213,7 +213,7 @@ class ChatCLI:
         return Path.home() / '.lab'
 
     def get_context_convos_dir(self) -> Path:
-        return self.current_context / 'convos'
+        return self.context / 'convos'
 
     def get_context_state_file(self) -> Path:
         return self.get_context_convos_dir() / 'context_state.json'
@@ -225,24 +225,24 @@ class ChatCLI:
     def __init__(self, config_path: str):
         self.config = self.load_config(config_path)
 
-        self.current_context = Path.cwd()
+        self.context = Path.cwd()
         self.convos_dir = self.lab_home() / 'convos'
         self.prompts_dir = self.lab_home() / 'prompts'
         self.state_file = self.lab_home() / 'chat_state.json'
         self.first_convo: Optional[str] = None
         
         # Current state
-        self.current_convo = None
-        self.current_prompts = []
-        self.current_model = self.config['default_model']
-        self.current_endpoint = self.config['default_endpoint']
+        self.convo = None
+        self.prompts = []
+        self.model = self.config['default_model']
+        self.endpoint = self.config['default_endpoint']
         self.retry_message: Optional[str] = ''
         self.tool_processing = False  # Track when processing tools
 
         self.restore_last_convo = bool(self.config.get('restore_last_convo', True))
 
         # Initialize context state before loading
-        self.current_context_state = {}
+        self.context_state = {}
 
         self.load_user_state()
         self.load_context_state()
@@ -258,7 +258,7 @@ class ChatCLI:
         self.setup_openai()
 
     def setup_openai(self):
-        endpoint_config = self.config['endpoints'][self.current_endpoint]
+        endpoint_config = self.config['endpoints'][self.endpoint]
         if (api_key := endpoint_config['key_env']).isupper():
             if not (api_key := os.getenv(api_key)):
                 raise ValueError(f"Missing {api_key} environment variable")
@@ -276,16 +276,16 @@ class ChatCLI:
                 candidate = Path.cwd() / ctx
 
             if candidate.exists() and candidate.is_dir():
-                self.set_current_context(candidate)  # Use centralized method to chdir
+                self.set_context(candidate)  # Use centralized method to chdir
 
         fc = state.get('first_convo')
         if isinstance(fc, str) and fc:
             self.first_convo = fc
 
-    def set_current_context(self, new_context: Path):
+    def set_context(self, new_context: Path):
         """Set current context and change working directory."""
-        old_context = self.current_context
-        self.current_context = new_context
+        old_context = self.context
+        self.context = new_context
 
         os.chdir(new_context)  # Single place for chdir
         
@@ -298,7 +298,7 @@ class ChatCLI:
 
     def save_user_state(self):
         state = {
-            'last_context': str(self.current_context.resolve()),
+            'last_context': str(self.context.resolve()),
             'first_convo': self.first_convo,
             'saved_at': datetime.datetime.now().isoformat() + 'Z',
         }
@@ -311,7 +311,7 @@ class ChatCLI:
         if not isinstance(state, dict):
             state = {}
 
-        self.current_context_state = state
+        self.context_state = state
 
         # Find last conversation for this context
         last_convo = state.get('last_convo')
@@ -329,21 +329,21 @@ class ChatCLI:
                     selected = candidate
                     break
 
-        self.current_convo = selected
+        self.convo = selected
 
     def save_context_state(self):
         context_convos_dir = self.get_context_convos_dir()
         context_state_file = self.get_context_state_file()
         
-        save_json_file(context_state_file, self.current_context_state)
+        save_json_file(context_state_file, self.context_state)
 
     def set_context_convo(self, convo_id: Optional[str]):
-        self.current_convo = convo_id
+        self.convo = convo_id
 
-        if not self.current_context_state:
-            self.current_context_state = {}
+        if not self.context_state:
+            self.context_state = {}
 
-        self.current_context_state['last_convo'] = convo_id
+        self.context_state['last_convo'] = convo_id
 
         self.save_context_state()
 
@@ -422,39 +422,39 @@ class ChatCLI:
                 # Complete command arguments
                 if len(words) >= 2 and words[0].startswith('/'):
                     cmd = words[0]
-                    current_arg = words[-1]
-                    start_pos = -len(current_arg)
+                    arg = words[-1]
+                    start_pos = -len(arg)
                     
                     try:
                         if cmd == '/switch':
                             # Complete directories from current working directory
                             base_path = Path.cwd()
-                            for item in base_path.glob(current_arg + '*'):
+                            for item in base_path.glob(arg + '*'):
                                 if item.is_dir():
                                     rel_path = str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
                         
                         elif cmd == '/inject':
                             # Complete files and directories
-                            if current_arg.startswith('./'):
+                            if arg.startswith('./'):
                                 # Current context relative
-                                base_path = self_outer.current_context
-                                search_pattern = current_arg[2:] + '*'
+                                base_path = self_outer.context
+                                search_pattern = arg[2:] + '*'
                                 for item in base_path.glob(search_pattern):
                                     rel_path = './' + str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
-                            elif current_arg.startswith('/'):
+                            elif arg.startswith('/'):
                                 # Absolute path completion
-                                if '/' in current_arg:
-                                    base_path = Path(current_arg).parent
-                                    search_pattern = Path(current_arg).name + '*'
+                                if '/' in arg:
+                                    base_path = Path(arg).parent
+                                    search_pattern = Path(arg).name + '*'
                                     if base_path.exists():
                                         for item in base_path.glob(search_pattern):
                                             yield Completion(str(item), start_position=start_pos)
                             else:
                                 # Relative to current working directory
                                 base_path = Path.cwd()
-                                for item in base_path.glob(current_arg + '*'):
+                                for item in base_path.glob(arg + '*'):
                                     rel_path = str(item.relative_to(base_path))
                                     yield Completion(rel_path, start_position=start_pos)
                     
@@ -514,19 +514,19 @@ class ChatCLI:
         return f"{max_num + 1:04d}"
 
     def build_meta_state(self, *, include_title: bool = False, title: Optional[str] = None, convo_id: Optional[str] = None) -> Dict[str, Any]:
-        context_rel = str(self.current_context)
+        context_rel = str(self.context)
 
         payload: Dict[str, Any] = {
             'timestamp': datetime.datetime.now().isoformat() + 'Z',
             'context': context_rel,
-            'model': self.current_model,
-            'endpoint': self.current_endpoint,
+            'model': self.model,
+            'endpoint': self.endpoint,
             'prompts': [
                 {
                     'prompt': prompt['name'],
                     'version': prompt['version'],
                     'snapshot': prompt['snapshot']
-                } for prompt in self.current_prompts
+                } for prompt in self.prompts
             ]
         }
 
@@ -544,7 +544,7 @@ class ChatCLI:
         context_parts = []
         
         # Add prompts
-        for prompt in self.current_prompts:
+        for prompt in self.prompts:
             context_parts.append(f"=== PROMPT: {prompt['name']} v{prompt['version']} ===")
             context_parts.append(prompt['snapshot'])
             context_parts.append("")
@@ -563,9 +563,9 @@ class ChatCLI:
 
         # Add context info
         context_parts.append(f"=== CURRENT CONTEXT ===")
-        context_parts.append(f"Directory: {self.current_context}")
-        context_parts.append(f"Conversation: {self.current_convo or 'None'}")
-        context_parts.append(f"Model: {self.current_model} ({self.current_endpoint})")
+        context_parts.append(f"Directory: {self.context}")
+        context_parts.append(f"Conversation: {self.convo or 'None'}")
+        context_parts.append(f"Model: {self.model} ({self.endpoint})")
         context_parts.append("")
         
         return "\n".join(context_parts)
@@ -582,11 +582,11 @@ class ChatCLI:
         os.chmod(filepath, self.PERM_IMMUTABLE)
 
     def write_meta_update(self):
-        if not self.current_convo:
+        if not self.convo:
             return
 
-        convo_dir = self.get_convo_path(self.current_convo)
-        meta = self.build_meta_state(convo_id=self.current_convo)
+        convo_dir = self.get_convo_path(self.convo)
+        meta = self.build_meta_state(convo_id=self.convo)
         self.write_convo_file(convo_dir, meta, 'meta')
 
     def load_injected_file(self, file_path: Path, base_context: Path = None, check_duplicates: bool = False) -> List[Dict[str, Any]]:
@@ -594,7 +594,7 @@ class ChatCLI:
         
         Args:
             file_path: Path to the injected text file
-            base_context: Base context for resolving ./ paths (defaults to current_context)
+            base_context: Base context for resolving ./ paths (defaults to context)
             check_duplicates: If True, checks against existing injected_files to avoid duplicates
         
         Returns:
@@ -604,7 +604,7 @@ class ChatCLI:
             return []
         
         if base_context is None:
-            base_context = self.current_context
+            base_context = self.context
             
         injected_files = []
         seen = set()
@@ -661,7 +661,7 @@ class ChatCLI:
 
         # Auto-inject Makefile
         if self.config.get('auto_inject_makefile', True):
-            makefile_path = self.current_context / 'Makefile'
+            makefile_path = self.context / 'Makefile'
             if makefile_path.exists():
                 injected_files.append({
                     'file': str(makefile_path),
@@ -669,11 +669,11 @@ class ChatCLI:
                 })
 
         # Auto-injected files from injected.txt
-        injected_txt_path = self.current_context / 'injected.txt'
+        injected_txt_path = self.context / 'injected.txt'
         injected_files.extend(self.load_injected_file(injected_txt_path))
         
         # Manual injections from local.injected.txt
-        local_injected_path = self.current_context / 'convos' / 'local.injected.txt'
+        local_injected_path = self.context / 'convos' / 'local.injected.txt'
         manual_injections = self.load_injected_file(local_injected_path, check_duplicates=False)
         injected_files.extend(manual_injections)
         
@@ -739,7 +739,7 @@ class ChatCLI:
     
     def create_convo_symlink(self, convo_id: str, name: str):
         """Create symlink to conversation in current context."""
-        context_convos_dir = self.current_context / 'convos'
+        context_convos_dir = self.context / 'convos'
         context_convos_dir.mkdir(exist_ok=True)
         
         # Sanitize name for filename
@@ -788,7 +788,7 @@ class ChatCLI:
         raise ValueError(f"Invalid prompt format in {prompt_name}")
 
     def get_pending_user_message(self) -> Optional[str]:
-        if not self.current_convo:
+        if not self.convo:
             return None
 
         history = self.load_convo_history()
@@ -812,7 +812,7 @@ class ChatCLI:
         tools = self.get_available_tools() if use_tools else None
         print("TOOLS", tools)
         response = self.client.chat.completions.create(
-            model=self.current_model,
+            model=self.model,
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -823,10 +823,10 @@ class ChatCLI:
 
     def send_message(self, message: str) -> str:
         """Send a message to the AI and get response."""
-        if not self.current_convo:
+        if not self.convo:
             self.create_convo()
         
-        convo_dir = self.get_convo_path(self.current_convo)
+        convo_dir = self.get_convo_path(self.convo)
 
         pending_message = self.retry_message
         retry_this_turn = bool(pending_message is not None and pending_message == message)
@@ -894,10 +894,10 @@ class ChatCLI:
     
     def load_convo_history(self) -> List[Dict]:
         """Load conversation history."""
-        if not self.current_convo:
+        if not self.convo:
             return []
         
-        convo_dir = self.get_convo_path(self.current_convo)
+        convo_dir = self.get_convo_path(self.convo)
         history = []
         
         for filepath in sorted(convo_dir.glob('*.yaml')):
@@ -915,18 +915,18 @@ class ChatCLI:
     def switch_context(self, path):
         """Perform context switching."""
         # Switch to specific context
-        old_convo = self.current_convo
+        old_convo = self.convo
         new_context = (Path.cwd() / path).resolve()
         print(f"Switching to {new_context}...")
 
         if new_context.exists() and new_context.is_dir():
 
-            old_context = self.set_current_context(new_context)
+            old_context = self.set_context(new_context)
             
             self.load_context_state()  # Load context after changing directory
 
-            new_convo = self.current_convo
-            new_context_rel = str(self.current_context)
+            new_convo = self.convo
+            new_context_rel = str(self.context)
 
             if old_convo:
                 leave_meta: Dict[str, Any] = {
@@ -983,7 +983,7 @@ class ChatCLI:
         """Handle conversation commands."""
         if not args:
             # List conversations in current context
-            convos_dir = self.current_context / 'convos'
+            convos_dir = self.context / 'convos'
             if convos_dir.exists():
                 print("Conversations in this context:")
                 for symlink in convos_dir.glob('*.yaml'):
@@ -1001,7 +1001,7 @@ class ChatCLI:
             convo_id = self.create_convo(name)
             print(f"Created conversation: {convo_id}")
         elif args[0] == 'fork':
-            if not self.current_convo:
+            if not self.convo:
                 print("No conversation to fork")
                 return
             name = args[1] if len(args) > 1 else None
@@ -1010,7 +1010,7 @@ class ChatCLI:
         else:
             # Switch to existing conversation
             convo_name = args[0]
-            convos_dir = self.current_context / 'convos'
+            convos_dir = self.context / 'convos'
             symlink_path = convos_dir / f"{convo_name}.yaml"
             
             if symlink_path.exists() and symlink_path.is_symlink():
@@ -1050,7 +1050,7 @@ class ChatCLI:
             print("Available contexts:")
             for item in Path.cwd().iterdir():
                 if item.is_dir() and not item.name.startswith('.'):
-                    marker = " (current)" if item == self.current_context else ""
+                    marker = " (current)" if item == self.context else ""
                     print(f"  {item.name}{marker}")
         else:
             self.switch_context(args[0])
@@ -1069,7 +1069,7 @@ class ChatCLI:
         """Handle prompt management."""
         if not args:
             print("Current prompts:")
-            for prompt in self.current_prompts:
+            for prompt in self.prompts:
                 print(f"  {prompt['name']} v{prompt['version']}")
             return
         
@@ -1080,7 +1080,7 @@ class ChatCLI:
             prompt_name = args[1]
             try:
                 prompt = self.load_prompt(prompt_name)
-                self.current_prompts.append(prompt)
+                self.prompts.append(prompt)
                 self.write_meta_update()
                 print(f"Added prompt: {prompt_name}")
             except ValueError as e:
@@ -1090,7 +1090,7 @@ class ChatCLI:
                 print("Usage: /prompt drop <prompt_name>")
                 return
             prompt_name = args[1]
-            self.current_prompts = [p for p in self.current_prompts if p['name'] != prompt_name]
+            self.prompts = [p for p in self.prompts if p['name'] != prompt_name]
             self.write_meta_update()
             print(f"Dropped prompt: {prompt_name}")
         else:
@@ -1098,7 +1098,7 @@ class ChatCLI:
     
     def handle_inject(self, args: List[str]):
         """Handle file injection using local.injected.txt."""
-        local_injected_path = self.current_context / 'convos' / 'local.injected.txt'
+        local_injected_path = self.context / 'convos' / 'local.injected.txt'
         
         if not args:
             print("Currently injected files:")
@@ -1125,7 +1125,7 @@ class ChatCLI:
             # Remove from local.injected.txt using shared save function
             try:
                 # Read existing lines and filter out the target file
-                existing_injections = self.load_injected_file(local_injected_path, base_context=self.current_context, check_duplicates=False)
+                existing_injections = self.load_injected_file(local_injected_path, base_context=self.context, check_duplicates=False)
                 filtered_injections = [inj['file'] for inj in existing_injections if inj['file'] != file_path]
                 
                 # Also read raw lines to preserve comments and formatting
@@ -1156,7 +1156,7 @@ class ChatCLI:
             # Support both lab-root-relative and current-context-relative paths
             if file_path.startswith('./'):
                 # Current context relative (./main.py)
-                full_path = self.current_context / file_path[2:]
+                full_path = self.context / file_path[2:]
                 stored_path = str(full_path)
             else:
                 # Relative to current working directory (ideas/cli/main.py)
@@ -1176,7 +1176,7 @@ class ChatCLI:
     def handle_model(self, args: List[str]):
         """Handle model management."""
         if not args:
-            print(f"Current model: {self.current_model} ({self.current_endpoint})")
+            print(f"Current model: {self.model} ({self.endpoint})")
             return
         
         if args[0] == 'list':
@@ -1190,34 +1190,34 @@ class ChatCLI:
         if ':' in model_name:
             model_name, endpoint = model_name.split(':', 1)
             if endpoint in self.config['endpoints']:
-                self.current_endpoint = endpoint
+                self.endpoint = endpoint
                 self.setup_openai()
             else:
                 print(f"Unknown endpoint: {endpoint}")
                 return
         
-        self.current_model = model_name
+        self.model = model_name
         self.write_meta_update()
-        print(f"Switched to model: {model_name} ({self.current_endpoint})")
+        print(f"Switched to model: {model_name} ({self.endpoint})")
 
     def show_config(self):
         """Show current configuration."""
         print("Current Configuration:")
-        print(f"  Model: {self.current_model} ({self.current_endpoint})")
-        print(f"  Context: {self.current_context}")
+        print(f"  Model: {self.model} ({self.endpoint})")
+        print(f"  Context: {self.context}")
         print(f"  Conversation Store: {self.convos_dir}")
         print(f"  Prompt Library: {self.prompts_dir}")
         print(f"  Auto-inject Makefile: {self.config.get('auto_inject_makefile', True)}")
         print(f"  History File: {self.history_file}")
         
-        if self.current_convo:
-            print(f"  Current Conversation: {self.current_convo}")
+        if self.convo:
+            print(f"  Current Conversation: {self.convo}")
         else:
             print("  Current Conversation: None")
         
-        if self.current_prompts:
-            print(f"  Active Prompts: {len(self.current_prompts)}")
-            for prompt in self.current_prompts:
+        if self.prompts:
+            print(f"  Active Prompts: {len(self.prompts)}")
+            for prompt in self.prompts:
                 print(f"    - {prompt['name']} v{prompt['version']}")
         else:
             print("  Active Prompts: None")
@@ -1232,16 +1232,16 @@ class ChatCLI:
 
     def show_status(self):
         """Show current status."""
-        print(f"context: {self.current_context}")
-        print(f"convo:   {self.current_convo or 'None'}")
-        if self.current_prompts:
-            prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.current_prompts])
+        print(f"context: {self.context}")
+        print(f"convo:   {self.convo or 'None'}")
+        if self.prompts:
+            prompts_str = ', '.join([f"{p['name']} v{p['version']}" for p in self.prompts])
             print(f"prompts: {prompts_str}")
-        print(f"model:   {self.current_model} ({self.current_endpoint})")
+        print(f"model:   {self.model} ({self.endpoint})")
         
     def show_history(self):
         """Show conversation history."""
-        if not self.current_convo:
+        if not self.convo:
             print("No active conversation")
             return
         
@@ -1262,21 +1262,21 @@ class ChatCLI:
     def get_status_line(self) -> str:
         """Generate status line for display."""
         parts = []
-        parts.append(f"context: {self.current_context}")
+        parts.append(f"context: {self.context}")
         
-        if self.current_convo:
-            convo_dir = self.get_convo_path(self.current_convo)
+        if self.convo:
+            convo_dir = self.get_convo_path(self.convo)
             meta_file = convo_dir / '0001-meta.yaml'
             if meta_file.exists():
                 with open(meta_file, 'r') as f:
                     meta = pyyaml.safe_load(f)
-                parts.append(f"convo: {meta['title']} ({self.current_convo[:8]})")
+                parts.append(f"convo: {meta['title']} ({self.convo[:8]})")
         
-        if self.current_prompts:
-            prompts_str = ', '.join([f"{p['name']}" for p in self.current_prompts])
+        if self.prompts:
+            prompts_str = ', '.join([f"{p['name']}" for p in self.prompts])
             parts.append(f"prompts: {prompts_str}")
         
-        parts.append(f"model: {self.current_model}")
+        parts.append(f"model: {self.model}")
         
         return ' | '.join(parts)
 
